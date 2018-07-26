@@ -1,0 +1,1437 @@
+---
+pagetitle: "SGSS Exceedance Report: North West"
+output: 
+  html_document: 
+      theme: simplex
+      toc: yes
+      toc_depth: 4
+      toc_float:
+        collapsed: no
+        smooth_scroll: yes
+params:
+  geog:
+    label: "PHE Region:"
+    input: select
+    value: "North West"
+    choices: ["England","North East","North West","Yorkshire and the Humber","East Midlands","West Midlands","East of England","London","South East","South West"]
+  organism:
+    label: "Organism:"
+    input: select
+    value: "ENTEROCOCCUS"
+    choices: ["ENTEROCOCCUS","ACHROMOBACTER","PSEUDOMONAS","KLEBSIELLA","ACINETOBACTER","LISTERIA","LEGIONELLA","INFLUENZA A","INFLUENZA B","PARAINFLUENZA"]
+  antibiotic:
+    label: "Antibiotic:"
+    input: select
+    value: "VANCOMYCIN"
+    choices: ["NONE","VANCOMYCIN","PENICILLIN","AMOXYCILLIN/CLAVULANATE","CARBAPENEMS","CIPROFLOXACIN","GENTAMICIN","CEFOTAXIME","CEFTAZIDIME","CEFTRIAXONE","ALL"]
+  spectype:
+    label: "Specimen types to omit"
+    input: select
+    multiple: true
+    value: "NONE"
+    choices: ["Blood","Bones & Joints","Faeces & Lower gut","Genital","Urine/Kidney","Fluids","Lower Respiratory Tract","URT/Mouth/Ear","Tissues","Brain & Cerebral","Tips & Lines","Wound Swabs","Swabs - General"]
+  episode_window: 
+    label: "Infection episode window length (days):"
+    value: 14
+    input: numeric
+    min: 1
+    max: 365
+  ref_date:
+    label: "Analysis reference date:"
+    input: date
+    value: "2018-01-01"
+  sgss_module:
+    label: "SGSS module:"
+    input: select
+    value: "AMR"
+    choices: ["AMR","CDR"]
+  map_type:
+    label: "Map type:"
+    input: select
+    value: "Interactive"
+    choices: ["Static","Interactive"]
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, 
+                      error=FALSE, 
+                      warning=FALSE,
+                      tidy=TRUE,
+                      include=FALSE,
+                      message=FALSE)
+
+#   rm(list = ls()) ## clear everything.
+
+# epi functions
+library(epitools)
+library(exactci)
+library(EpiFunc)
+library(surveillance)
+
+# data management
+library(tidyverse)
+library(janitor)
+library(data.table)
+library(lubridate)
+
+# markdown and formatting
+library(knitr)
+library(kableExtra)
+library(ggplot2)
+library(cowplot)
+library(ggrepel)
+
+# mapping tools
+library(rgisws)
+library(ggmap)
+library(leaflet)
+
+# for setting the SGSS query geography
+param_phe <- case_when(
+  params$geog=="England" ~ "England",
+  params$geog=="North East" ~ "E12000001",
+  params$geog=="North West" ~ "E12000002",
+  params$geog=="Yorkshire and the Humber" ~ "E12000003",
+  params$geog=="East Midlands" ~ "E12000004",
+  params$geog=="West Midlands" ~ "E12000005",
+  params$geog=="East of England" ~ "E12000006",
+  params$geog=="London" ~ "E12000007",
+  params$geog=="South East" ~ "E12000008",
+  params$geog=="South West" ~ "E12000009"
+)
+
+param_year <- 2012
+
+getwd()
+
+```
+
+```{r functions}
+#  PHE_Region_Codes
+#  E12000001 - North East
+#  E12000002 - North West
+#  E12000003 - Yorkshire and the Humber
+#  E12000004 - East Midlands
+#  E12000005 - West Midlands
+#  E12000006 - East of England
+#  E12000007 - London
+#  E12000008 - South East
+#  E12000009 - South West 
+#  
+#  phe_region left blank will include all regions
+#  
+#  abx can be listed as "ALL" or "NONE"
+#  
+#  organism can be either "GENUS" or "GENUS SPECIES"
+#  
+#  this method may return duplicate records; ensure you check your dataset carefully.
+
+sgss_query <- function(organism,
+                       abx="NONE",
+                       phe_region=c("UK","E12000001","E12000002","E12000003","E12000004","E12000005","E12000006","E12000007","E12000008","E12000009"),
+                       year_from=1990:format(Sys.Date(),"%Y"),
+                       year_to=format(Sys.Date(),"%Y"),
+                       module=c("AMR","CDR")){
+  
+  if(year_from<=1990 | year_from>format(Sys.Date(),"%Y")){
+    stop(paste("year_from required and must be between 1990 and",format(Sys.Date(),"%Y")))
+  } 
+  if(missing(organism) | organism==""){
+    stop("either enter GENUS or SPECIES with the full [Genus species] name, eg. ENTEROBACTER or PSEUDOMONAS AERUGINOSA")
+  }else{
+    organism <- toupper(organism)
+  }
+  if(phe_region=="UK"){
+    warning("no PHE Region specified, will run for all regions (UK)")
+  }else{
+    phe_region <- toupper(phe_region)
+  }
+  if(abx=="NONE" | abx=="none"){
+    warning("will not include antibiotic suscectibility data; run with ALL or specific ABX if you want to include")
+  }else{
+    abx <- toupper(abx)
+  }
+  
+  #   Open ODBC connection to SGSS, specify driver details
+  odbc_connection <- RODBC::odbcDriverConnect('driver={SQL Server};server=CSSGSSG01.sgss.local\\PHESGSSSQL01;database=SGSSDW;trusted_connection=true')
+
+# ensure joins are made appropriately and correct tables are used
+  if(module=="AMR"){
+    mod1 <- "[OUTRIGGER_AMR_SUSCEPTIBILITY]"
+    mod2 <- "FACT_AMR_SUSCEPTIBILITY"
+    mod3 <- "AMR_Specimen_Request_Susceptibility_SK"
+    mod4 <- "[Outrigger_AMR_Susceptibility_SK]"
+    mod5 <- "[Super_Output_Area_Geography_SK]"
+    mod6 <- "[Specimen_Bacteraemia_SK]"
+  }
+  if(module=="CDR"){
+    mod1 <- "[OUTRIGGER_SPECIMEN_REQUEST]"
+    mod2 <- "FACT_OPIE_AND_SPECIMEN_REQUEST"
+    mod3 <- "CDR_Specimen_Request_SK"
+    mod4 <- "[Specimen_Request_Outrigger_SK]"
+    mod5 <- "[Super_Output_Area_SK]"
+    mod6 <- "[Specimen/Bacteraemia_SK]"
+  }
+  
+  ##   this is the base query, all others will just be modifications of this.
+  query <- paste0(
+    "SELECT DISTINCT ",
+    mod1,".[Patient_NHS_Number] as [NHSno], ",
+    mod1,".[Hospital_Patient_Number] as [HOSno], ",
+    mod1,".[Patient_Date_Of_Birth] as [DoB], ",
+    mod1,".[Patient_Surname] as [Surname], ",
+    mod1,".[Patient_PostCode] as [Postcode], ",
+    mod1,".[Specimen_Number], ",
+"[DIMENSION_DATE].[Date] as [Specimen_Date], 	
+[DIMENSION_DATE].[Calendar_Year] as [Year],
+[DIMENSION_DATE].[Month] as [Month], 
+[DIMENSION_DATE].[Week] as [Week],
+[DIMENSION_DATE].[Calendar_Quarter] as [Quarter], 
+[DIMENSION_DEMOGRAPHIC].[Patient_Sex_Character] as [Sex], 
+[DIMENSION_DEMOGRAPHIC].[Age_in_Years] as [Ageyr], 
+[DIMENSION_DEMOGRAPHIC].[Age_in_Months] as [Agemo], 
+[DIMENSION_LAB_GEOGRAPHY].[Lab_Geography_SK], 
+[DIMENSION_LAB_GEOGRAPHY].[Lab_Geography_Name_Current] as [Lab_Name], 
+[DIMENSION_LAB_GEOGRAPHY].[Lab_Geography_Code] as [Lab_Code], 
+[DIMENSION_SITE_GEOGRAPHY].[Site_Name],
+[DIMENSION_SITE_GEOGRAPHY].[NHS_Trust_Code],
+[DIMENSION_SITE_GEOGRAPHY].[NHS_Trust_Name],
+[DIMENSION_SPECIMEN_BACTERAEMIA].[Specimen_Group_Code] as [Specimen_Type_Code], 
+[DIMENSION_SPECIMEN_BACTERAEMIA].[Specimen_Group_Description] as [Specimen_Type], 
+[DIMENSION_ORGANISM].[Organism_Category_Description], 
+[DIMENSION_ORGANISM].[Organism_Genus_Name], 
+[DIMENSION_ORGANISM].[Organism_Species_Name],
+[DIMENSION_ORGANISM].[Molecular_Type], 
+[DIMENSION_ORGANISM].[Phagetype], 
+[DIMENSION_ORGANISM].[Serotype], ")
+  
+  #i  Antimicrobial Suscectibility data 1/3
+  if(abx!="NONE"){
+    query <- paste0(query,
+                    "[DIMENSION_ANTIMICROBIAL_RESULT].[Antimicrobial_Description] as [Abx], 
+                    [DIMENSION_ANTIMICROBIAL_RESULT].[Antimicrobial_Family_Group_Description] as [Abx_Group], 
+                    FACT.Susceptible_Count as [Total_S],
+                    FACT.Intermediate_Count as [Total_I], 
+                    FACT.Resistant_Count as [Total_R], "
+    )
+  }
+  #i  note that PHE_Region in SGSS is actually PHE_Centre
+  query <- paste0(query,
+"[DIMENSION_SUPER_OUTPUT_AREA].[Country_Description] as [Country],
+[DIMENSION_SUPER_OUTPUT_AREA].[Lower_Super_Output_Area_Code],
+[DIMENSION_SUPER_OUTPUT_AREA].[Local_Authority_Name], 
+[DIMENSION_SUPER_OUTPUT_AREA].[Local_Authority_Code], 
+[DIMENSION_SUPER_OUTPUT_AREA].[Health_Protection_Team_Name], 
+[DIMENSION_SUPER_OUTPUT_AREA].[PHE_Region_Code] as [PHE_Centre_Code],    
+[DIMENSION_SUPER_OUTPUT_AREA].[PHE_Region_Name] as [PHE_Centre_Name],
+[DIMENSION_SUPER_OUTPUT_AREA].[UK_Region_Code] as [PHE_Region_Code],
+[DIMENSION_SUPER_OUTPUT_AREA].[UK_Region_Description] as [PHE_Region_Name] ",
+"FROM ",mod2," FACT ",
+"LEFT JOIN [DIMENSION_ORGANISM] ON FACT.[Organism_SK]=[DIMENSION_ORGANISM].[Organism_SK] 
+LEFT JOIN [DIMENSION_DATE] ON FACT.[Specimen_Date_SK]=[DIMENSION_DATE].[Date_SK] 
+LEFT JOIN [DIMENSION_DEMOGRAPHIC] ON FACT.[Demographic_SK]=[DIMENSION_DEMOGRAPHIC].[Demographic_SK] 
+LEFT JOIN [DIMENSION_LAB_GEOGRAPHY] ON FACT.[Reporting_Lab_Geography_SK]=[DIMENSION_LAB_GEOGRAPHY].[Lab_Geography_SK] 
+LEFT JOIN [DIMENSION_SPECIMEN_BACTERAEMIA] ON FACT.",mod6,"=[DIMENSION_SPECIMEN_BACTERAEMIA].[Specimen_Bacteraemia_SK] 
+LEFT JOIN [DIMENSION_SITE_GEOGRAPHY] ON FACT.Site_Geography_SK=[DIMENSION_SITE_GEOGRAPHY].[Site_Geography_SK] 
+LEFT JOIN [DIMENSION_SUPER_OUTPUT_AREA] ON FACT.",mod5,"=[DIMENSION_SUPER_OUTPUT_AREA].[Lower_Super_Output_Area_SK] 
+LEFT JOIN ",mod1," ON FACT.",mod3,"=",mod1,".",mod4," ")
+
+  #i  MOD THE SQL QUERY APPROPRIATELY  
+  #i  Antimicrobial Suscectibility data 2/3
+  if(abx!="NONE"){
+    query <- paste0(query,
+                    "LEFT JOIN [DIMENSION_ANTIMICROBIAL_RESULT] ON FACT.Antimicrobial_Result_SK=[DIMENSION_ANTIMICROBIAL_RESULT].[Antimicrobial_Result_SK] "
+    )
+  }
+  #i  Time parameters
+  query <- paste0(query,
+                  "WHERE [DIMENSION_DATE].[Calendar_Year] BETWEEN ",year_from," AND ",year_to," ")
+  
+  #i  Geography parameters.
+  if(phe_region!="UK"){
+    query <- paste0(query,
+                    "AND [DIMENSION_SUPER_OUTPUT_AREA].[UK_Region_Code] IN ('",phe_region,"') "
+    )
+  }
+
+  #i  Antimicrobial Suscectibility data 3/3
+  if(abx!="NONE"){
+    if(abx!="ALL"){
+      if(abx=="CARBAPENEMS"){
+        query <- paste0(query," AND Antimicrobial_Description IN ('DORIPENEM','ERTAPENEM','FAROPENEM','IMIPENEM','MEROPENEM') ")
+        }else{
+        query <- paste0(query," AND Antimicrobial_Description IN ('",abx,"') ")
+        }
+    }
+  }
+  
+  #i  ORGANISM selection; if there is a space, search SPECIES if no space search GENUS
+  if(grepl("\\s",organism)==TRUE){
+    query <- paste0(query,"AND ([DIMENSION_ORGANISM].[Organism_Species_Name] LIKE ('%",organism,"%') ")
+    genus <- word(organism)
+  }else{
+    if(organism %in% c("PARAINFLUENZA","ROTAVIRUS","NOROVIRUS","POLIOVIRUS","SAPOVIRUS")){
+      query <- paste0(query,"AND ([DIMENSION_ORGANISM].[Organism_Species_Name] IN ('",organism,"') ")
+      genus <- organism
+    }else{
+      query <- paste0(query,"AND ([DIMENSION_ORGANISM].[Organism_Genus_Name] IN ('",organism,"') ")
+      genus <- organism
+    }
+  }
+  
+  #   Adjust for some species which SGSS gets wrong (keep adding here)
+  if(genus=="ENTEROCOCCUS"){
+    query <- paste(query,"OR [DIMENSION_ORGANISM].[Organism_Species_Name] LIKE ('%STREPTOCOCCUS GROUP D%')")
+  }
+  if(genus=="ACHROMOBACTER"){
+    query <- paste(query,"OR [DIMENSION_ORGANISM].[Organism_Species_Name] IN ('ALCALIGENES PIECHAUDII','ALCALIGENES XYLOSOXIDANS','ALCALIGENES XYLOSOXIDANS XYLOSOXIDANS')")
+  }
+  if(genus=="KLEBSIELLA"){
+    query <- paste(query,"OR [DIMENSION_ORGANISM].[Organism_Species_Name] IN ('CALYMMATOBACTERIUM GRANULOMATIS','CALYMMATOBACTERIUM SP')")
+  }
+  if(genus=="PSEUDOMONAS"){
+    query <- paste(query,"OR [DIMENSION_ORGANISM].[Organism_Species_Name] IN ('CHRYSEOMONAS LUTEOLA','FLAVIMONAS ORYZIHABITANS','CHRYSEOMONAS SP')")
+  }
+  if(genus=="ROTHIA"){
+    query <- paste(query,"OR [DIMENSION_ORGANISM].[Organism_Species_Name] IN ('STOMATOCOCCUS SP','STOMATOCOCCUS MUCILAGINOSUS')")
+  }
+  if(genus=="ELIZABETHKINGIA"){
+    query <- paste(query,"OR [DIMENSION_ORGANISM].[Organism_Species_Name] IN ('CHRYSEOBACTERIUM MENINGOSEPTICUM','CHRYSEOBACTERIUM MIRICOLA')")
+  }
+  if(genus=="COLLINSELLA"){
+    query <- paste(query,"OR [DIMENSION_ORGANISM].[Organism_Species_Name] IN ('EUBACTERIUM AEROFACIENS')")
+  }
+  if(genus=="MYROIDES"){
+      query <- paste(query,"OR [DIMENSION_ORGANISM].[Organism_Species_Name] IN ('FLAVOBACTERIUM ODORATUM')")
+  }
+  if(genus=="GORDONIA"){
+      query <- paste(query,"OR [DIMENSION_ORGANISM].[Organism_Species_Name] IN ('GORDONIA BRONCHIALIS (RHODOCOCCUS BRONCHIALIS)')")
+  }
+  if(genus=="AGROBACTERIUM"){
+      query <- paste(query,"OR [DIMENSION_ORGANISM].[Organism_Species_Name] IN ('RHIZOBIUM RADIOBACTER (AGROBACTERIUM TUMEFACIENS)')")
+  }
+  if(genus=="GRIMONTIA"){
+      query <- paste(query,"OR [DIMENSION_ORGANISM].[Organism_Species_Name] IN ('VIBRIO HOLLISAE')")
+  }
+  if(genus=="CUPRIAVIDUS"){
+      query <- paste(query,"OR [DIMENSION_ORGANISM].[Organism_Species_Name] IN ('WAUTERSIA SP')")
+  }
+  #i  final closing bracket.
+  query <- paste0(query,")")
+  
+  
+  #i  clean the query. removing the tabs and breaks.
+  query <- gsub("\n","",query)
+  query <- gsub("\t","",query)
+  query <- gsub(",",", ",query)
+  query <- gsub("  "," ",query)
+  
+  #i run SQL query on SGSS
+  sgss  <- RODBC::sqlQuery(odbc_connection,query,stringsAsFactors = FALSE)
+  
+  #i disconnect from SGSS
+  rm(odbc_connection)
+  
+  print(query)
+  return(sgss)
+}
+
+
+##  SOME LABS STILL CODE ORGANISMS AS OLDER SPECIES NAMES SO WE FIX IT.
+organism_recode <- function(sgss_dt,species,genus){
+  sgss_dt <- sgss_dt %>% ungroup() %>%
+    mutate(
+      genus=case_when(
+        species %in% c("ALCALIGENES PIECHAUDII","ALCALIGENES XYLOSOXIDANS","ALCALIGENES XYLOSOXIDANS XYLOSOXIDANS","ALCALIGENES DENITRIFICANS") ~ "ACHROMOBACTER",
+        species %in% c("CHRYSEOMONAS LUTEOLA","FLAVIMONAS ORYZIHABITANS","CHRYSEOMONAS SP") ~ "PSEUDOMONAS",
+        species=="COMAMONAS ACIDOVORANS" ~ "DELFTIA",
+        species %in% c("CHRYSEOBACTERIUM MENINGOSEPTICUM","CHRYSEOBACTERIUM MIRICOLA") ~ "ELIZABETHKINGIA",
+        species %in% c("CALYMMATOBACTERIUM GRANULOMATIS","CALYMMATOBACTERIUM SP") ~ "KLEBSIELLA",
+        species=="EUBACTERIUM AEROFACIENS" ~ "COLLINSELLA",
+        species=="FLAVOBACTERIUM ODORATUM" ~ "MYROIDES",
+        species=="GORDONIA BRONCHIALIS (RHODOCOCCUS BRONCHIALIS)" ~ "GORDONIA",
+        species=="RHIZOBIUM RADIOBACTER (AGROBACTERIUM TUMEFACIENS)" ~ "AGROBACTERIUM",
+        species %in% c("STOMATOCOCCUS MUCILAGINOSUS","STOMATOCOCCUS SP") ~ "ROTHIA",
+        species=="VIBRIO HOLLISAE" ~ "GRIMONTIA",
+        species=="WAUTERSIA SP" ~ "CUPRIAVIDUS",
+        species %in% c("STREPTOCOCCUS GROUP D STEM","ENTEROCOCCUS FAECALIS") ~ "ENTEROCOCCUS",
+        TRUE ~ genus),
+      species=case_when(
+        species=="ALCALIGENES PIECHAUDII" ~ "ACHROMOBACTER PIECHAUDII",
+        species %in% c("ALCALIGENES XYLOSOXIDANS","ALCALIGENES XYLOSOXIDANS XYLOSOXIDANS") ~ "ACHROMOBACTER XYLOSOXIDANS",
+        species=="ALCALIGENES DENITRIFICANS" ~ "ACHROMOBACTER DENITRIFICANS",
+        species=="CHRYSEOMONAS LUTEOLA" ~ "PSEUDOMONAS LUTEOLA",
+        species=="FLAVIMONAS ORYZIHABITANS" ~ "PSEUDOMONAS ORYZIHABITANS",
+        species=="COMAMONAS ACIDOVORANS" ~ "DELFTIA ACIDOVORANS",
+        species=="CHRYSEOBACTERIUM MENINGOSEPTICUM" ~ "ELIZABETHKINGIA MENINGOSEPTICA",
+        species=="CHRYSEOBACTERIUM MIRICOLA" ~ "ELIZABETHKINGIA MIRICOLA",
+        species=="AGGREGATIBACTER (HAEMOPHILUS) SEGNIS" ~ "AGGREGATIBACTER SEGNIS",
+        species=="ANAEROCOCCUS (PEPTOSTREPTOCOCCUS) PREVOTII" ~ "ANAEROCOCCUS PREVOTII",
+        species=="CALYMMATOBACTERIUM GRANULOMATIS" ~ "KLEBSIELLA GRANULOMATIS" ,
+        species=="CALYMMATOBACTERIUM SP" ~ "KLEBSIELLA SP",
+        species=="CHRYSEOMONAS SP" ~ "PSEUDOMONAS SP",
+        species=="EUBACTERIUM AEROFACIENS" ~ "COLLINSELLA AEROFACIENS",
+        species=="FLAVOBACTERIUM ODORATUM" ~ "MYROIDES ODORATUS",
+        species=="GORDONIA BRONCHIALIS (RHODOCOCCUS BRONCHIALIS)" ~ "GORDONIA BRONCHIALIS",
+        species %in% c("LEPTOSPIRA HARDJO","LEPTOSPIRA ICTEROHAEMORRHAGIAE") ~ "LEPTOSPIRA INTERROGANS",
+        species=="PSYCHROBACTER PHENYLPYRUVICUS (MORAXELLA PHENYLPYRUVICA)" ~ "PSYCHROBACTER PHENYLPYRUVICUS",
+        species=="RHIZOBIUM RADIOBACTER (AGROBACTERIUM TUMEFACIENS)" ~ "AGROBACTERIUM TUMEFACIENS",
+        species=="RHODOCOCCUS EQUI (CORYNEBACTERIUM EQUI)" ~ "RHODOCOCCUS EQUI",
+        species=="SHEWANELLA PUTREFACIENS (PSEUDOMONAS PUTREFACIENS)" ~ "SHEWANELLA PUTREFACIENS",
+        species=="STOMATOCOCCUS MUCILAGINOSUS" ~ "ROTHIA MUCILAGINOSA",
+        species=="STOMATOCOCCUS SP" ~ "ROTHIA SP",
+        species=="VIBRIO HOLLISAE" ~ "GRIMONTIA HOLLISAE",
+        species=="WAUTERSIA SP" ~ "CUPRIAVIDUS SP",
+        species %in% c("STREPTOCOCCUS GROUP D STEM","ENTEROCOCCUS FAECALIS","ENTEROCOCCUS FAECALIS (STREPTOCOCCUS FAECALIS)") ~ "ENTEROCOCCUS FAECALIS",
+        species=="ENTEROBACTER AGGLOMERANS (PANTOEA AGGLOMERANS)" ~ "PANTOEA AGGLOMERANS (ENTEROBACTER AGGLOMERANS)",
+        TRUE ~ species)
+    )
+}
+
+# recode specimen sample types into more manageable groupings
+spectype_recode <- function(sgss_dt,spectype){
+  sgss_dt <- sgss_dt %>% ungroup() %>%
+    mutate(
+      spectype=case_when(
+        spectype %in% c("BLOOD","CORD BLOOD") ~ "Blood",
+        spectype %in% c("JOINT","SYNOVIAL FLUID","BONE","JOINT PROSTHESIS","BONE PIN/PLATE","BONE MARROW") ~ "Bones & Joints",
+        spectype %in% c("FAECES","RECTUM","PERIANAL","GI TRACT","COLOSTOMY","GASTRIC","GALL BLADDER","STOOL","ISCHIO-RECTAL","DUODENUM","FAECES/LOWER GASTRO-INTESTINAL TRACT") ~ "Faeces & Lower gut",
+        spectype %in% c("ASCITIC FLUID","FLUID - NOS","PLEURAL FLUID","PUS (SOURCE UNKNOWN)","SPUTUM","PERITONEAL FLUID","BILE","SEMEN","BREAST MILK","CHEST DRAIN","DRAIN SITE","PUS SOURCE UNKNOWN") ~ "Fluids",
+        spectype %in% c("HVS","LOWER GENITAL TRACT","LVS","PENIS","VAGINA","VULVA","CERVIX","ENDOCERVICAL","BARTHOLIN GLAND","PROSTATE","UPPER GENITAL TRACT") ~ "Genital",
+        spectype %in% c("BAL","BRONCHIAL","TRACHEA","LUNG","ALVEOLAR LAVAGE","CHEST","PLEURA","LOWER RESPIRATORY TRACT") ~ "Lower Respiratory Tract",
+        spectype %in% c("SWAB - NOS","ASPIRATION","BLISTER","EYE","NOSE","SKIN ULCER","SKIN/WOUND","UMBILICAL CORD","UNKNOWN","NASAL","ABSCESS","PRESSURE SORE","BURN","UMBILICUS","GROIN - NOS","TOE","NECKLINE","ULCER - NOS","UNASSIGNED SPECIMEN","LIP","BIOPSY - NOS","FINGER","NAIL","NORMAL SKIN","CYST","SWAB","UNASSIGNED PARENT") ~ "Swabs - General",
+        spectype %in% c("ARTERIAL LINE TIP","INTRA-VASCULAR LINE","IV CATHETER TIP","CVP LINE TIP","VENFLON","HICKMAN LINE","IUCD","TIP - NOS","EPIDURAL") ~ "Tips & Lines",
+        spectype %in% c("TISSUE","PLACENTA","PERINEUM","LYMPH NODES","LIVER","PERITONEUM","CORNEA","APPENDIX","SKIN SCRAPING","SPLEEN","AXILLARY LYMPH NODE","HEART/HEART VALVE","CARDIOVASCULAR SYSTEM","HEART VALVE","PACEMAKER","PRODUCTS OF CONCEPTION","MUSCLE","PERICARDIUM","BREAST","LIVER/BILE","UPPER GASTRO-INTESTINAL TRACT","MEDIASTINUM") ~ "Tissues",
+        spectype %in% c("CSU","MSU","NEPHROSTOMY","PERITONEAL DIALYSATE","SUPRAPUBIC ASPIRATE","URINARY CATHETER","URINE","URETHRA","EMU","SPA","URINE/KIDNEY") ~ "Urine/Kidney" ,
+        spectype %in% c("ENDOTRACHEAL ASPIRATE","MIDDLE EAR","MOUTH","NPA","OUTER EAR","SALIVA","THROAT","ENDOTRACHEAL TUBE","TONGUE","TRACHEAL ASPIRATE","DENTAL ABSCESS","SINUS (NASAL)","PERNASAL","ENDOTRACHEAL SECRETIONS","UPPER RESPIRATORY TRACT","MIDDLE EAR/MASTOID","PHARYNGEAL") ~ "URT/Mouth/Ear",
+        spectype %in% c("CSF","BRAIN","CNS SHUNT","CSF SHUNT","BRAIN/SPINAL CORD") ~ "Brain & Cerebral",
+        spectype %in% c("WOUND (SURGICAL)","WOUND (TRAUMATIC)","WOUND") ~ "Wound Swabs",
+        TRUE ~ spectype)
+    )
+  return(sgss_dt)
+  }
+
+
+# removes QC samples from SGSS extracts
+rm_qc_samples <- function(sgss_dt,HOSno,SPECno,ptSurname){
+
+  qc_terms <- c("SENS", "NEQAS", "QC", "QUALITY", "IQA", "DIST", "SPEC", "TEST","TBT","LIQAS")
+  qc_terms2 <- c("NEQAS", "QUALITY","ANTIMICROBIAL SUSCEPTABILITY","ANTIFUNGAL SUSCEPTIBILITY","TBT","QC","INTERNAL QC")
+
+  sgss_dt <- sgss_dt %>% ungroup() %>%
+    mutate(ptSurname = ifelse(is.na(ptSurname)== TRUE, "", ptSurname),
+           HOSno = str_trim(HOSno),
+           SPECno = str_trim(SPECno),
+           qc = ifelse(str_detect(HOSno, paste(qc_terms, collapse = "|")) == TRUE |
+                         str_detect(SPECno, paste(qc_terms, collapse = "|")) == TRUE |
+                         str_detect(ptSurname, paste(qc_terms2, collapse = "|")) == TRUE, 1, 0),
+           qc = ifelse(is.na(HOSno) == TRUE & is.na(qc) == TRUE, 0, qc)) %>%
+    filter(qc != 1) %>%
+    select(-qc)
+}
+
+# FES NW NHS Trust recode
+# Creates a NHS Trust mapping based on Site_Name and HPT for
+# NHS Trusts in the PHE North West Region
+pheNW_trust_map <- function(sgss_dt,Site_Name,HPT){
+  sgss_dt <- sgss_dt %>% ungroup() %>%
+    mutate(
+      trust=case_when(
+        Site_Name %in% c("MANCHESTER ROYAL INFIRMARY","COUNTESS OF CHESTER","BLACKPOOL VICTORIA HOSPITAL","COUNTESS OF CHESTER HOSPITAL","ELLESMERE PORT HOSPITAL","KIRKLEY","TRAFFORD GENERAL HOSPITAL","ALTRINCHAM GENERAL HOSPITAL") & HPT == "Greater Manchester" ~ "CENTRAL MANCHESTER UNIVERSITY HOSPITALS NHS FOUNDATION TRUST",
+        Site_Name=="MANCHESTER ROYAL INFIRMARY" & HPT %in% c("Cheshire and Merseyside","Cumbria and Lancashire")  ~ "CENTRAL MANCHESTER UNIVERSITY HOSPITALS NHS FOUNDATION TRUST",
+        Site_Name=="Unknown" & HPT=="Greater Manchester" ~ "TRUST UNKNOWN",
+        Site_Name %in% c("FAIRFIELD GENERAL HOSPITAL","NORTH MANCHESTER GENERAL HOSPITAL","ROYAL OLDHAM HOSPITAL","ROYAL OLDHAM HOSPITAL MENTAL HEALTH SERVICES","THE ROYAL OLDHAM HOSPITAL","ROCHDALE INFIRMARY","BIRCH HILL HOSPITAL") & HPT=="Greater Manchester" ~ "PENNINE ACUTE HOSPITALS NHS TRUST",
+        Site_Name %in% c("NHS LONG STAY UNIT - DERMOT MURPHY CLOSE","WITHINGTON HOSPITAL","WYTHENSHAWE HOSPITAL") & HPT=="Greater Manchester" ~ "UNIVERSITY HOSPITAL OF SOUTH MANCHESTER NHS FOUNDATION TRUST",
+        Site_Name=="WYTHENSHAWE HOSPITAL" & HPT %in% c("Cheshire and Merseyside","Cumbria and Lancashire") ~ "UNIVERSITY HOSPITAL OF SOUTH MANCHESTER NHS FOUNDATION TRUST",
+        Site_Name %in% c("SALFORD ROYAL","SALFORD ROYAL HOSPITAL","HOPE HOSPITAL") & HPT=="Greater Manchester" ~ "SALFORD ROYAL NHS FOUNDATION TRUST",
+        Site_Name %in% c("STEPPING HILL HOSPITAL","STEPPING HILL HOSPITAL MENTAL HEALTH SERVICES") & HPT=="Greater Manchester" ~ "STOCKPORT NHS FOUNDATION TRUST",
+        Site_Name %in% c("TAMESIDE GENERAL HOSPITAL","TAMESIDE HOSPITAL MENTAL HEALTH SERVICES") & HPT=="Greater Manchester" ~ "TAMESIDE HOSPITAL NHS FOUNDATION TRUST",
+        Site_Name %in% c("THE CHRISTIE","THE CHRISTIE NHS FOUNDATION TRUST") & HPT=="Greater Manchester" ~ "THE CHRISTIE NHS FOUNDATION TRUST",
+        Site_Name %in% c("ROYAL BOLTON HOSPITAL","THE ROYAL BOLTON HOSPITAL") & HPT=="Greater Manchester" ~ "BOLTON NHS FOUNDATION TRUST",
+        Site_Name %in% c("ARROWE PARK HOSPITAL","CLATTERBRIDGE HOSPITAL") & HPT=="Cheshire and Merseyside" ~ "WIRRAL UNIVERSITY TEACHING HOSPITAL NHS FOUNDATION TRUST",
+        Site_Name %in% c("BROADGREEN HOSPITAL","ROYAL LIVERPOOL UNIVERSITY DENTAL HOSPITAL","ROYAL LIVERPOOL UNIVERSITY HOSPITAL","ROYAL LIVERPOOL AND BROADGREEN UNIVERSITY HOSPITALS NHS TRUST") & HPT=="Cheshire and Merseyside" ~ "ROYAL LIVERPOOL AND BROADGREEN UNIVERSITY HOSPITALS NHS TRUST",
+        Site_Name %in% c("ROYAL LIVERPOOL UNIVERSITY HOSPITAL") & HPT=="Cumbria and Lancashire" ~ "TRUST UNKNOWN",
+        Site_Name %in% c("COUNTESS OF CHESTER","COUNTESS OF CHESTER HOSPITAL","ELLESMERE PORT HOSPITAL","FAIRFIELD GENERAL HOSPITAL","TRAFFORD GENERAL HOSPITAL","A AND E DEPARTMENT") & HPT=="Cheshire and Merseyside" ~ "COUNTESS OF CHESTER HOSPITAL NHS FOUNDATION TRUST",
+        Site_Name %in% c("ST HELENS HOSPITAL","WHISTON HOSPITAL","WHISTON HOSPTAL","NEWTON COMMUNITY HOSPITAL") & HPT=="Cheshire and Merseyside" ~ "ST HELENS AND KNOWSLEY HOSPITAL SERVICES NHS TRUST",
+        Site_Name %in% c("ORMSKIRK AND DISTRICT GENERAL HOSPITAL","SOUTHPORT AND FORMBY DISTRICT GENERAL HOSPITAL","SOUTHPORT AND FORMBY DISTRICT GENERAL HOSPITAL","ORMSKIRK AND DISTRICT GENERAL HOSPITAL") & HPT=="Cheshire and Merseyside" ~ "SOUTHPORT AND ORMSKIRK HOSPITAL NHS TRUST",
+        Site_Name %in% c("ORMSKIRK AND DISTRICT GENERAL HOSPITAL","SOUTHPORT AND FORMBY DISTRICT GENERAL HOSPITAL","SOUTHPORT GENERAL INFIRMARY","SOUTHPORT AND FORMBY DISTRICT GENERAL HOSPITAL","ORMSKIRK AND DISTRICT GENERAL HOSPITAL") & HPT=="Cumbria and Lancashire" ~ "SOUTHPORT AND ORMSKIRK HOSPITAL NHS TRUST",
+        Site_Name=="LIVERPOOL HEART AND CHEST HOSPITAL NHS TRUST HQ" & HPT=="Cheshire and Merseyside" ~ "LIVERPOOL HEART AND CHEST HOSPITAL NHS FOUNDATION TRUST",
+        Site_Name %in% c("MACCLESFIELD DISTRICT GENERAL HOSPITAL","MACCLESFIELD DISTRICT GENERAL HOSPITAL (SRFT)", "WEAVERHAM SURGERY","VERNOVA - MACCLESFIELD DISTRICT GENERAL HOSPITAL") & HPT=="Cheshire and Merseyside" ~ "EAST CHESHIRE NHS TRUST",
+        Site_Name %in% c("UNIVERSITY HOSPITAL AINTREE","AINTREE HOSPITALS - OPD","FAZAKERLEY HOSPITAL","AINTREE UNIVERSITY HOSPITAL","WALTON HOSPITAL") & HPT=="Cheshire and Merseyside" ~ "AINTREE UNIVERSITY HOSPITAL NHS FOUNDATION TRUST",
+        Site_Name=="THE WALTON CENTRE FOR NEUROLOGY AND NEUROSURGERY" & HPT=="Cheshire and Merseyside" ~ "THE WALTON CENTRE NHS FOUNDATION TRUST",
+        Site_Name %in% c("BLACKPOOL VICTORIA HOSPITAL","BISPHAM HOSPITAL REHABILITATION UNIT","ROSSALL HOSPITAL") & HPT=="Cumbria and Lancashire" ~ "BLACKPOOL TEACHING HOSPITALS NHS FOUNDATION TRUST",
+        Site_Name %in% c("ROYAL BLACKBURN HOSPITAL","BURNLEY GENERAL HOSPITAL","ACCRINGTON VICTORIA HOSPITAL","PENDLE COMMUNITY HOSPITAL","CLITHEROE COMMUNITY HOSPITAL","ROSSENDALE HOSPITAL") & HPT=="Cumbria and Lancashire" ~ "EAST LANCASHIRE HOSPITALS NHS TRUST",
+        Site_Name %in% c("CUMBERLAND INFIRMARY","WEST CUMBERLAND HOSPITAL","CUMBERLAND INFIRMARY - CARLISLE") & HPT=="Cumbria and Lancashire" ~ "NORTH CUMBRIA UNIVERSITY HOSPITALS NHS TRUST",
+        Site_Name %in% c("SOUTHPORT AND FORMBY DISTRICT GENERAL HOSPITAL","ROYAL PRESTON HOSPITAL","CHORLEY AND SOUTH RIBBLE HOSPITAL","CHORLEY AND SOUTH RIBBLE HOSPITAL") & HPT=="Cumbria and Lancashire" ~ "LANCASHIRE TEACHING HOSPITALS NHS FOUNDATION TRUST",
+        Site_Name %in% c("ADDENBROOKES HOSPITAL","KING'S COLLEGE HOSPITAL (DENMARK HILL)", "SOUTHAMPTON GENERAL HOSPITAL") & HPT=="Cumbria and Lancashire" ~ "TRUST UNKNOWN",
+        Site_Name %in% c("LEIGHTON HOSPITAL","ELMHURST INTERMEDIATE CARE UNIT","MID CHESHIRE HOSPITALS NHS FOUNDATION TRUST") & HPT=="Cheshire and Merseyside" ~ "MID CHESHIRE HOSPITALS NHS FOUNDATION TRUST",
+        Site_Name %in% c("WARRINGTON HOSPITAL","HALTON GENERAL HOSPITAL") & HPT=="Cheshire and Merseyside" ~ "WARRINGTON AND HALTON HOSPITALS NHS FOUNDATION TRUST",
+        Site_Name %in% c("MARYPORT HOSPITAL","PENRITH HOSPITAL","WIGTON HOSPITAL","MARYPORT COTTAGE HOSPITAL","COCKERMOUTH HOSPITAL","WORKINGTON COMMUNITY HOSPITAL","CARLISLE COMMUNITY MENTAL HEALTH TEAM") & HPT=="Cumbria and Lancashire" ~ "CUMBRIA PARTNERSHIP NHS FOUNDATION TRUST",
+        Site_Name %in% c("WRIGHTINGTON HOSPITAL","ROYAL ALBERT EDWARD INFIRMARY","LEIGH INFIRMARY") & HPT=="Greater Manchester" ~ "WRIGHTINGTON, WIGAN AND LEIGH NHS FOUNDATION TRUST",
+        Site_Name=="ROYAL LIVERPOOL CHILDRENS HOSPITAL" & HPT=="Cheshire and Merseyside" ~ "ALDER HEY CHILDRENS NHS FOUNDATION TRUST",
+        Site_Name %in% c("LIVERPOOL WOMENS HOSPITAL","LIVERPOOL WOMANS HOSPITAL") & HPT=="Cheshire and Merseyside" ~ "LIVERPOOL WOMENS NHS FOUNDATION TRUST",
+        Site_Name=="THE CLATTERBRIDGE CANCER CENTRE" & HPT=="Cheshire and Merseyside" ~ "THE CLATTERBRIDGE CANCER CENTRE NHS FOUNDATION TRUST",
+        Site_Name %in% c("FURNESS GENERAL HOSPITAL","ROYAL LANCASTER INFIRMARY","WESTMORLAND GENERAL HOSPITAL") & HPT=="Cumbria and Lancashire" ~ "UNIVERSITY HOSPITALS OF MORECAMBE BAY NHS FOUNDATION TRUST",
+        Site_Name=="ROCHDALE INFIRMARY" ~ "PENNINE ACUTE HOSPITALS NHS TRUST",
+        Site_Name=="WHISTON HOSPITAL" ~ "ST HELENS AND KNOWSLEY HOSPITAL SERVICES NHS TRUST",
+        TRUE ~ "TRUST UNKNOWN")
+    )
+  return(sgss_dt)
+}
+
+# create a patientID
+patient_id <- function(dt,NHSno,HOSno,DoB){
+
+  dt$id <- 1:nrow(dt)
+  dt$id <- as.numeric(dt$id)
+  nhs_unknown <- c(0000000000,1234567890,9876543210,9999999999,NA)
+
+  dt <- dt %>%
+    arrange(Specimen_Date) %>%
+    group_by(NHSno, DoB) %>%
+    mutate(id=ifelse(!NHSno %in% nhs_unknown & DoB!="1900-01-01",id[1],id)) %>%
+    group_by(HOSno, DoB) %>%
+    mutate(id=ifelse(!is.na(HOSno) & DoB!="1900-01-01",id[1],id)) %>%
+    group_by(NHSno, HOSno) %>%
+    mutate(id=ifelse(!NHSno %in% nhs_unknown & !is.na(HOSno),id[1],id)) %>%
+    ungroup() %>%
+    select(1:id)
+}
+
+farrflex.graph <- function(dt, hpt="", title=""){
+# thanks Tom. stole and adapted from GI tracker.
+
+# set timeseries max/min for region before filtering into HPTs
+  max_x <- as.POSIXct(max(dt$Specimen_Date, na.rm=T))
+  min_x <- as.POSIXct(min(dt$Specimen_Date, na.rm=T))
+  
+# set b value for farrington calculations
+# NOTE: index <1 error means that the b value is too high.
+  b <- year(max_x)-year(min_x)-1
+  print(paste("Total years used for FarringtonFlexible algorithm:",b))
+  
+# regional or HPT
+  if(hpt!=""){
+    x <- dt %>% filter(Health_Protection_Team_Name==hpt)
+    print(paste("HPT only graph:",hpt))
+  }else{
+    x <- dt
+    print("FS regional graph")
+  }
+
+# summarise data by day
+  x <- x %>% 
+    group_by(Specimen_Date) %>% 
+    summarise(count=n())  %>%
+    mutate(Specimen_Date=as.POSIXct(Specimen_Date))
+
+# creat a full timeseries, for all days, so you dont miss any timeperiods
+  timeseries <- seq.POSIXt(min_x, max_x, by="day")
+  timeseries <- data.frame(Specimen_Date=timeseries)  # put this time series into a data.frame
+  x <- full_join(timeseries,x, by = "Specimen_Date")  # join the timeseries
+
+# fill in 0 counts
+  x$count[is.na(x$count)] <- 0
+
+# regroup by week and setup data in correct structure
+# do i keep the specimen date?
+  x <- x %>% 
+    arrange(Specimen_Date) %>%
+    mutate(yearwk=ifelse(isoweek(Specimen_Date)<10,
+                            paste0(isoyear(Specimen_Date),"0",isoweek(Specimen_Date)),
+                            paste0(isoyear(Specimen_Date),isoweek(Specimen_Date)))) %>%
+    group_by(yearwk) %>%
+    summarise(count=sum(count)) %>%
+    mutate(state=0) %>%
+    arrange(yearwk) %>% ungroup() %>%
+    mutate(yearwk=as.factor(yearwk))
+
+  # create STS surveillance class dataset
+  disProg <-create.disProg(week = x$yearwk,
+                               observed = x$count,
+                               state = x$state,
+                               start = c(param_year,1),
+                               freq = 52,
+                               epochAsDate = F)
+  sts <- disProg2sts(disProg)
+  
+  # apply the exceedance algorithm
+  sts.flex <- farringtonFlexible(sts,
+                                     control = list(range = (dim(sts)[[1]] - 53) : dim(sts)[[1]],
+                                                    b = b,
+                                                    w = 3,
+                                                    thresholdMethod = "nbPlugin"))
+  # reformat the data so you can graph it
+  tail <- tail(x, n=54)
+  flex.data <- data.frame(tail$yearwk, 
+                              sts.flex@observed, 
+                              sts.flex@alarm, 
+                              sts.flex@upperbound)
+  flex.data <- flex.data %>% 
+    rename("week"="tail.yearwk",
+           "alert"="observed.1",
+           "threshold"="observed.2") %>%
+    mutate(yr=substr(week,1,4),
+           wk=substr(week,5,6)) 
+  
+  # graph it.
+  farrgraph <- ggplot(flex.data, 
+                      aes(x=week, y=observed, fill=factor(alert))) +
+    geom_bar(stat="identity", colour="ivory4") +
+    scale_fill_manual(breaks=c(F,T),
+                       values=c("FALSE"="#00B092","TRUE"="#822433"),
+                       labels=c("In threshold","Alert")) +
+    geom_line(data=flex.data, 
+              aes(x=week, y=threshold, group=1), 
+              colour="red", linetype=2) +    
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90,
+                                     vjust = 0.5,
+                                     hjust=1),
+          panel.grid.minor=element_blank(),
+          panel.grid.major=element_blank(),
+          legend.title=element_blank()) +
+    scale_y_continuous(name="Number of cases", 
+                       breaks=scales::pretty_breaks(), 
+                       expand = c(0.01,0.01)) +
+    scale_x_discrete(name="Year and Week") +
+    labs(title=title)
+  
+  return(farrgraph)
+  
+}
+
+
+csum_graph <- function(dt, hpt="", title=""){
+  
+# set timeseries max/min for region before filtering into HPTs
+min_x <- floor_date(as.POSIXct(min(dt$Specimen_Date, na.rm=T)),"year")
+max_x <- as.POSIXct(max(dt$Specimen_Date, na.rm=T))
+
+# regional or HPT
+if(hpt!=""){
+  x <- dt %>% filter(Health_Protection_Team_Name==hpt)
+  print(paste("HPT only graph:",hpt))
+}else{
+  x <- dt
+  print("FS regional graph")
+}
+
+# summarise data by day
+x <- x %>% 
+  group_by(Specimen_Date) %>% 
+  summarise(count=n())  %>%
+  mutate(Specimen_Date=as.POSIXct(Specimen_Date))
+
+# creat a full timeseries, for all days, so you dont miss any timeperiods
+timeseries <- seq.POSIXt(min_x, max_x, by="day")
+timeseries <- data.frame(Specimen_Date=timeseries)  # put this time series into a data.frame
+x <- full_join(timeseries,x, by = "Specimen_Date")  # join the timeseries
+
+# fill in 0 counts
+x$count[is.na(x$count)] <- 0
+
+# regroup by week and setup data in correct structure with mean cumsum
+x <- x %>% 
+  arrange(Specimen_Date) %>%
+  mutate(iyr=isoyear(Specimen_Date),
+         iwk=isoweek(Specimen_Date),
+         yearwk=ifelse(isoweek(Specimen_Date)<10,
+                       paste0(isoyear(Specimen_Date),"0",isoweek(Specimen_Date)),
+                       paste0(isoyear(Specimen_Date),isoweek(Specimen_Date)))) %>%
+  filter(iyr>=param_year) %>%
+  group_by(yearwk,iyr,iwk) %>%
+  summarise(count=sum(count)) %>%
+  arrange(yearwk) %>% ungroup() %>%
+  mutate(yearwk=as.factor(yearwk)) %>%
+  group_by(iyr) %>% 
+  mutate(csum=cumsum(count)) %>%
+  group_by(iwk, !iyr %in% report_year) %>%
+  mutate(msum=round(mean(csum))) %>%
+  ungroup() %>%
+  filter(iyr>=report_year-1) %>%
+  arrange(iwk,iyr) %>% 
+  group_by(iwk) %>% 
+  mutate(msum=msum[1]) %>% 
+  filter(iyr==report_year) %>% 
+  ungroup() %>% 
+  select(yearwk,count,csum,msum) %>%
+  mutate(alert=as.factor(ifelse(csum>msum,1,0)))
+
+# graph it.
+csum_graph <- ggplot(x, aes(x=yearwk, y=csum)) +
+  geom_line(data=x,aes(x=yearwk,y=csum), group=2, color="ivory4") +
+  geom_point(data=x, aes(color=alert), stat="identity") +
+  scale_color_manual(breaks=c(0,1),
+                     values=c("0"="#00B092","1"="#822433"),
+                     labels=c("In threshold","Alert")) +
+  geom_line(data=x, aes(x=yearwk, y=msum, group=1),
+            colour="red", linetype=2) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90,
+                                   vjust = 0.5,
+                                   hjust=1),
+        panel.grid.minor=element_blank(),
+        panel.grid.major=element_blank(),
+        legend.title=element_blank()) +
+  scale_y_continuous(name="Cumulative number of cases", 
+                     breaks=scales::pretty_breaks(), 
+                     expand = c(0.01,0.01)) +
+  scale_x_discrete(name="Year and Week") +
+  labs(title=title)
+  
+  return(csum_graph)
+  
+}
+
+```
+
+```{r SGSS_extract}
+##  DO THE SGSS EXTRACT.
+# what a sweet function.
+sgss <- sgss_query(params$organism,params$antibiotic,param_phe,param_year,2018,module=params$sgss_module)
+
+# no viral data on AMR module, if mis-set reclassify to CDR
+if(unique(sgss$Organism_Category_Description)=="VIRUS" & params$sgss_module=="AMR"){
+  error("No viral data in SGSS AMR module, rerun using CDR")
+}
+
+
+```
+
+```{r data_cleaning}
+dt <- as.data.table(sgss) ## copy the raw extract for modification.
+
+# remove the QC samples.
+dt <- rm_qc_samples(sgss,sgss$HOSno,sgss$Specimen_Number,sgss$Surname)
+
+# derive trusts from hospital site and HPT
+dt <- pheNW_trust_map(dt,dt$Site_Name,dt$Health_Protection_Team_Name)
+
+## recode organisms (SGSS)
+dt <- organism_recode(dt,dt$Organism_Species_Name,dt$Organism_Genus_Name)
+table(dt$Organism_Species_Name, dt$Organism_Genus_Name)
+table(dt$species, dt$genus)
+
+dt$DoB<-as.Date(dt$DoB)
+dt$Specimen_Date<-as.Date(dt$Specimen_Date)
+dt$NHSno<-as.numeric(dt$NHSno)
+dt$Health_Protection_Team_Name <- as.factor(dt$Health_Protection_Team_Name)
+
+dt <- dt[dt$Country=="England",]
+
+#   chop up em ages.
+dt$agegrp <- cut(dt$Ageyr, c(0,1,5,15,25,35,45,55,65,75,150), right=FALSE,
+                 labels = c("<1","1-4","5-14","15-24","25-34","35-44","45-54","55-64","65-74",">=75"))
+
+#   tag resistant 1/0; intermediates become resistant.
+if(params$antibiotic!="NONE"){
+  dt$R <- ifelse(dt$Total_R==1 | dt$Total_I==1, 1, 0)
+}
+
+# recode specimen types into fewer more generic groups
+dt <- spectype_recode(dt,dt$Specimen_Type)
+as.data.frame(table(dt$spectype))
+
+# remove any specimen types as selected from params
+rm_spectype <- levels(as.factor(params$spectype))
+for(i in rm_spectype){
+  dt <- filter(dt,spectype!=i)
+}
+as.data.frame(table(dt$spectype))
+
+
+## set quarterly groups
+dt <- dt %>% mutate(
+  qtr=case_when(
+    month(Specimen_Date)>=1 & month(Specimen_Date)<=3 ~ "January to March",
+    month(Specimen_Date)>=4 & month(Specimen_Date)<=6 ~ "April to June",
+    month(Specimen_Date)>=7 & month(Specimen_Date)<=9 ~ "July to September",
+    month(Specimen_Date)>=10 & month(Specimen_Date)<=12 ~ "October to December"),
+  cq=quarter(Specimen_Date)
+)
+
+## SET REPORT DATES
+extract_date <- max(dt$Specimen_Date)
+current_quarter <- quarter(extract_date)
+report_quarter <- ifelse(extract_date==round_date(extract_date,"quarter")-1,
+                         current_quarter,
+                         ifelse(current_quarter==1,4,current_quarter-1))
+report_year <- ifelse(current_quarter==1,year(extract_date)-1,year(extract_date))
+report_quarter_months <- case_when(report_quarter==1 ~ "January to March",
+                                   report_quarter==2 ~ "April to June",
+                                   report_quarter==3 ~ "July to September",
+                                   report_quarter==4 ~ "October to December")
+  
+  
+quarter_start <- dt %>% filter(cq==report_quarter & Year==report_year)
+quarter_end <- max(quarter_start$Specimen_Date)
+quarter_start <- min(quarter_start$Specimen_Date)
+reference_year <- report_year-1
+
+```
+
+```{r deduplication}
+
+# PATIENT ISOLATE GROUPINGS
+#i  GROUPED by NHSno, HOSno, DoB, assigns a unique IDno to each patient.
+#i  sort by specimen date
+#i  group by different combos of patient identifiers, also dont include invalid NHSnos
+dt <- patient_id(dt, NHSno, HOSno, DoB)
+
+#   dedup same day samples.
+if(params$antibiotic=="NONE"){
+  dt <- dt[!duplicated(dt[c('id','species','spectype','Specimen_Date')]), ]
+}else{
+  dt <- dt[!duplicated(dt[c('id','species','spectype','Specimen_Date','R')]), ]
+}
+
+# PATIENT EPISODE DEDUPLICATION ROLLING EPISODE WINDOW 
+
+  dt <- dt %>% 
+    arrange(id, species, spectype, Specimen_Date) %>% 
+    ungroup()
+
+##   this takes all records, and groups them into consecutive episodes per species per patient (id)
+##   isolates are grouped if they are within 14-days of the previous (bacteraemias)
+dt <- as.data.table(dt)
+dt$ep <- 0 #create a dummy column
+i<-1 #episode counter
+while(min(dt$ep)==0){
+  dt <- dt[order(id, species, spectype, Specimen_Date)]
+  dt[ep==0, days:=c(0,diff(Specimen_Date)), by=c("id", "species","spectype") #group the ungrouped records
+     ][ep==0 & days<params$episode_window,ep:=i] #tag specimens within same episode
+  i<-i+1
+}
+if(params$antibiotic!="NONE"){
+  dt[, R==max(R), by=c("id", "species","spectype","ep")] # capture resistance from episode
+}
+
+##  retain 1 record/episode
+dt <- dt[order(id, species, ep, spectype, Specimen_Date)]
+dt <- unique(dt, incomparables=F, fromLast=F, by=c("id", "species","spectype","ep")) 
+
+#i  group patient episode ID (must be done after unique)
+##  each pid represents an individual episode per patient per organism, a single patient wil have multiple PIDs
+dt$pid <- 1:nrow(dt) # same as gen id=_n
+dt$pid <- as.numeric(dt$pid)
+dt <- dt %>%
+  arrange(id,ep,species,spectype,Specimen_Date) %>%
+  group_by(id,ep,species,spectype) %>%
+  mutate(pid=pid[1]) %>%
+  ungroup() %>% 
+  select(id,Sex,agegrp,ep,pid,Specimen_Date,qtr,cq,Year,everything())
+
+# create a reference date dataset according to the date paramater
+ref_dt <- dt %>% filter(Specimen_Date>=params$ref_date)
+# restrict it to resistant isolates only if chosen
+if(params$antibiotic!="NONE"){
+  ref_dt <- ref_dt[ref_dt$R==1,]
+}
+percent_female <- round(t(prop.table(table(ref_dt$Sex)))[1]*100,2)
+hpts <- levels(dt$Health_Protection_Team_Name)
+
+```
+
+<br>
+
+![](./source/public-health-england.png){width=120px}
+
+
+# Field Service `r params$geog`
+__SGSS Exceedance Report__
+
+__Run on: `r format(Sys.Date(), '%d %B %Y')`; ISO week: `r isoweek(Sys.Date())`__
+
+__`r if(params$map_type=="Interactive"){"OFFICIAL - SENSITIVE"}`__
+
+`r if(params$map_type=="Interactive"){"This report is for internal PHE use only."}`
+
+This analysis is based on analysis of data from the Public Health England (PHE) Second Generation Surveillance System (SGSS), which captures data from NHS microbiology laboratories on a voluntary basis in England, Wales and Northern Ireland. `r if(params$geog!="England"){paste("This report only contains SGSS data reported in the",params$geog)}`
+
+Records have been deduplicated to reflect patient episodes. Patients were identified by NHS number, Hospital number and date of birth. A patient episode was categorised with a `r params$episode_window`-day rolling window based on specimen date, per species, per specimen site. `r if(params$antibiotic!="NONE"){"Where multiple isolates were present for a single patient episode with both susceceptible and resistant results (regardless of specimen order), the episode will be classified as resistant. Where data is shown from the reference date, it only includes resistant isolates."}`
+
+
+# `r params$organism`
+## Epidemiology
+
+```{r HPT_table_data}
+# table of HPT and FES total per calendar year
+tabHPT <- dt %>% ungroup() %>% 
+  group_by(Health_Protection_Team_Name,Year) %>% 
+  summarise(count=n()) %>% spread(Year,count)
+
+tabFS <- dt %>% ungroup() %>% 
+  group_by(Year) %>% 
+  summarise(count=n()) %>% 
+  spread(Year,count) %>% 
+  mutate(Health_Protection_Team_Name=paste("PHE",params$geog)) 
+
+tab <- bind_rows(tabHPT,tabFS) 
+tab <- rename(tab, "Health Protection Team"=Health_Protection_Team_Name)
+
+if(params$geog!="England"){
+  geotab <- tab
+  geotab_cap <- "Health Protection Team"
+}else{
+  geotab <- fs_table
+  geotab_cap <- "PHE Region"
+}
+
+## HPT with highest count
+  hi_hpt <- with(ref_dt,table(Health_Protection_Team_Name,Year))
+  hi_hpt <- names(which.max(hi_hpt[,ncol(hi_hpt)]))
+  
+## LAB with highest count
+  lab_table <- dt %>% 
+    group_by(Year,Lab_Name) %>% 
+    summarise(n=n()) %>% 
+    filter(!is.na(n)) %>% 
+    spread(Year,n) %>%
+    rename("Lab Name"=Lab_Name)
+  lab_table[is.na(lab_table)] <- 0
+  
+  hi_lab <- with(ref_dt,table(Lab_Name,Year))
+  hi_lab <- names(which.max(hi_lab[,ncol(hi_lab)]))
+
+  wk <- isoweek(extract_date)
+
+```
+
+```{r intro_bullets}
+
+  now <- nrow(dt[dt$Specimen_Date>=paste0(report_year,"-01-01"),])
+  then <- nrow(dt[dt$Specimen_Date>=paste0(report_year-1,"-01-01") & dt$Specimen_Date<=paste0(report_year-1,substr(max(dt$Specimen_Date,na.rm=T),5,10)),])
+  count_change <- round((now-then)/then*100,1)
+  
+  percent_male <- round(t(prop.table(table(dt$gender)))[2]*100,2)
+  percent_female <- round(t(prop.table(table(dt$gender)))[1]*100,2)
+
+  last_onset <- max(dt$Specimen_Date,na.rm=T)
+  peak <- dt %>% 
+    filter(Specimen_Date>=params$ref_date) %>% 
+    mutate(iw=isoweek(Specimen_Date),
+           iy=isoyear(Specimen_Date),
+           yw=factor(paste(iy,iw,sep="-"))) %>% 
+    group_by(yw) %>% 
+    summarise(n=n()) %>% 
+    filter(n==max(n))
+
+```
+
+<br>
+
+Between 01 Jan `r paste(format(Sys.Date(),"%d %b"),report_year)` there has been a __`r abs(count_change)`%__ `r ifelse(count_change>0,"increase","decrease")` in reported postive isolates compared to 01 Jan - `r paste(format(Sys.Date(),"%d %b"),report_year-1)`
+
+In the __`r params$geog`__ since __`r format(as.Date(params$ref_date), '%d %b %Y')`__: 
+
+  + there have been __`r nrow(dt[dt$Specimen_Date>=params$ref_date,])`__ cases 
+  + of which, __`r percent_female`%__ were female
+  + most cases were seen in the __`r hi_hpt`__ Health Protection Team
+  + __`r gsub("hpa","HPA",tools::toTitleCase(tolower(hi_lab)),ignore.case=T)`__ reported the highest number of cases
+  + the last reported specimen date was on __`r format(last_onset,na.rm=T, "%d %b %Y")`__ ISO week `r isoweek(last_onset)`)
+  + a peak of __`r max(peak$n)`__ cases was seen in ISO week(s) __`r peak$yw`__
+
+<br>
+
+__Al cases of `r params$organism` by `r geotab_cap` and year, `r params$geog`__
+
+```{r HPT_table, include=TRUE}
+kable(geotab, "html") %>% 
+    row_spec(nrow(geotab),bold=T) %>%
+    kable_styling(full_width=T)
+```
+
+<br>
+
+__All cases of `r params$organism` by reporting laboratory and year, `r params$geog`__
+
+```{r Lab_Table, include=TRUE}
+kable(lab_table, "html") %>% 
+  kable_styling(full_width=T) %>%
+  add_header_above(c(" "=1,"Total isolates"=year(Sys.Date())-param_year+1))
+```
+
+<br>
+
+__`r if(length(unique(dt$species))>1){paste("Summary of all",params$organism,"counts by species and year,",params$geog)}`__
+
+```{r Species_Table_Data}
+if(length(unique(dt$species))>1){
+# counts per species/year 
+  spec_counts <-  dt %>%
+    group_by(species,Year) %>%
+    summarise(n=n()) %>%
+    spread(Year,n) %>%
+    rename(Species=species)
+# reset NA to 0
+  spec_counts[is.na(spec_counts)] <- 0
+   
+  specC_cols <- ncol(spec_counts)-1
+   
+  spec_table <-  kable(spec_counts, "html") %>%
+    kable_styling(full_width=T) %>%
+    add_header_above(c(" "=1,"Total isolates"=specC_cols))
+}
+```
+```{r Species_Table, include=TRUE}
+if(length(unique(dt$species))>1){
+  spec_table
+}
+```
+<br>
+
+__Distribution of specimen types for all `r params$organism` isolates by year, `r params$geog`__
+
+```{r spectype_table, include=TRUE}
+spectype_table <- dt %>% group_by(spectype,Year) %>%
+  summarise(n=n()) %>%
+  spread(Year,n) %>%
+  rename("Specimen site"=spectype)
+
+if(params$spectype!="NONE"){
+  kable(spectype_table,"html") %>% kable_styling(full_width=T) %>%
+    footnote(general=paste(params$spectype,"specimens have been removed from the analysis."))
+}else{
+    kable(spectype_table,"html") %>% kable_styling(full_width=T)
+}
+```
+
+<br>
+
+<br>
+
+__`r ifelse(params$antibiotic=="NONE",paste("Epicurve of",params$organism,"from",format(as.Date(params$ref_date), "%d %b %Y"),",",params$geog),paste("Epicurve of",params$antibiotic,"resistant",params$organism,"from",format(as.Date(params$ref_date), "%d %b %Y"),",",params$geog))`__
+
+```{r EpiCurve_data}
+if(max(ref_dt$Specimen_Date)-min(ref_dt$Specimen_Date)<45){
+  epic_x <- "day"
+  epic_xlab <- "Days"
+  
+}else{
+  epic_x <- "iso.week"
+  epic_xlab <- "ISO Week"
+}
+if(length(unique(ref_dt$species))>1 & nrow(ref_dt)<300){
+epicurve <-  epicurve(ref_dt,
+         date.col="Specimen_Date",
+         time.period=epic_x,
+         start.at=params$ref_date,
+         stop.at=max(ref_dt$Specimen_Date),
+         xlab=epic_xlab,
+         fill.by="species",
+         col.pal="phe",
+         epi.squares=T,
+         blank.background=T,
+         na.rm=T) +
+    theme(legend.position = "bottom",
+          legend.text=element_text(size=8)) +
+    guides(fill=guide_legend(nrow=4))
+  
+}else{
+epicurve <- epicurve(ref_dt,
+         date.col="Specimen_Date",
+         time.period=epic_x,
+         start.at=params$ref_date,
+         stop.at=max(ref_dt$Specimen_Date),
+         xlab=epic_xlab,
+         col.pal="phe",
+         fill.by="genus",
+         epi.squares=F,
+         blank.background=T,
+         na.rm=T) 
+}
+epicurve
+```
+
+```{r EpiCurve, include=T, fig.height=4}
+epicurve
+```
+
+
+<br>
+
+__`r ifelse(params$antibiotic=="NONE",paste("Age-sex pyramid of",params$organism,"from",format(as.Date(params$ref_date), "%d %b %Y"),",",params$geog),paste("Age-sex pyramid of",params$antibiotic,"resistant",params$organism,"from",format(as.Date(params$ref_date), "%d %b %Y"),",",params$geog))`__
+
+```{r AgeSex, include=TRUE}
+
+age_sex_pyramid(ref_dt,"agegrp","Sex",col.pal="phe",blank.background=T)
+age_sex_pyramid(ref_dt,"agegrp","Sex",col.pal="phe",blank.background=T,split.by="Health_Protection_Team_Name")
+
+```
+
+<br>
+
+```{r i_can_show_you_the_world_maps}
+
+map <- ref_dt %>% select(1:days) %>% distinct(id,ep,Lab_Name,Specimen_Date,species,.keep_all=T)
+
+shp <- spTransform(readOGR("./source/shp_hpt"), 
+                   CRS("+proj=longlat +datum=WGS84"))
+
+shp_filter <- case_when(
+  params$geog=="England" ~ "England",
+  params$geog=="North East" ~ "X25003AE",
+  params$geog=="North West" ~ "X25003AG",
+  params$geog=="Yorkshire and the Humber" ~ "X25003AF",
+  params$geog=="East Midlands" ~ "X25002AF",
+  params$geog=="West Midlands" ~ "X25002AE",
+  params$geog=="East of England" ~ "X25002AG",
+  params$geog=="London" ~ "X25001AA",
+  params$geog=="South East" ~ "X25004AH",
+  params$geog=="South West" ~ "X25004AG"
+)
+
+if(params$geog!="England") {
+  shp <- shp[shp$PARENTPHEC=="X25003AG",]
+}
+
+# lookup postcode, join back to dataset
+pcds <- postcode_lookup(map$Postcode,xy=4326,col_names=c("pcds"))
+map <- inner_join(map,pcds,by=c("Postcode"="input_pcd"))
+
+## Create a boundary box to zoom manually
+bbox <- make_bbox(x, y, map)
+
+if(params$map_type=="Static"){
+  # Static map
+  ## Get a map centred on the boundary box
+  # used stamen because OSM was too granular and wouldnt allow download
+  map_loc <- get_map(location = bbox, 
+                     source="stamen", 
+                     maptype="toner-lite", 
+                     scale="auto",                    
+                     crop=F, 
+                     color="bw")
+  
+  ## Map and add the cases
+  if(length(unique(map$Lab_Name))>6){
+    map_fill <- map$Health_Protection_Team_Name
+  }else{
+    map_fill <- map$Lab_Name
+  }
+  static_map <- ggmap(map_loc, extent = 'device', maprange=F, legend="bottom") + 
+    geom_polygon(data=fortify(shp),
+                 aes(long,lat,group=group),
+                     color="black",fill=NA) +      
+    geom_point(data=map, 
+               aes(x=x, y=y, fill=map_fill), 
+               colour="black", 
+               pch=21, 
+               size=3) +
+    scale_fill_brewer(palette = "Dark2") +
+    labs(fill=" ") +
+    scale_size(guide="none") +
+    theme(axis.line=element_blank())
+  
+  
+}else{
+  # interactive leaflet map
+  # update with HPzone version, do i want markers with cluster or points
+  leaf_map <- leaflet(options=
+                        leafletOptions(maxZoom=13)) %>% 
+  addTiles(group = "OpenStreetMap") %>%
+  addPolygons(data = shp, fill = T, fillOpacity = 0.4,
+              weight = 1,
+              stroke = TRUE,
+              opacity = 1,
+              color = "black",
+              fillColor = "white",
+              group = "HPT",
+              label=~HPTNM) %>% 
+    addMarkers(data=map,
+               lng=~x,
+               lat=~y,
+               popup= paste("ID:", map$id, "<br/>",
+                            "Sex:", map$Sex, "<br/>", 
+                            "Age group:", map$agegrp, "<br/>",
+                            "Lab:", map$Lab_Name, "<br/>",
+                            "HPT:", map$Health_Protection_Team_Name,"<br/>",
+                            "Species:", map$species,"<br/>",
+                            "Specimen Date:", map$Specimen_Date),
+               clusterOptions=markerClusterOptions()) %>%
+    addMeasure() %>%
+    addControl(html='<font color="red">OFFICIAL - SENSITIVE</font>', position="bottomleft")
+}
+
+```
+
+<br>
+
+__`r ifelse(params$antibiotic=="NONE",paste("Map of",params$organism,"from",format(as.Date(params$ref_date), "%d %b %Y"),",",params$geog),paste("Map of",params$antibiotic,"resistant",params$organism,"from",format(as.Date(params$ref_date), "%d %b %Y"),",",params$geog))`__
+
+`r if(params$map_type=="Interactive"){"This map is for internal PHE use only."}`
+
+```{r choose_your_map, include=TRUE, messages=TRUE, fig.height=8}
+if(params$map_type=="Static"){
+  static_map
+}else{
+  leaf_map
+}
+
+```
+
+<br>
+
+```{r resistance_info}
+# PROPORTION R/Year 
+if(params$antibiotic!="NONE"){
+  year_prop <- dt %>% 
+    group_by(Year,R) %>% 
+    summarise(count=n()) %>% 
+    mutate(R=ifelse(R==1,"Res","Sens")) %>%
+    spread(R, count) %>% 
+    group_by(Year) %>% 
+    summarise(R=sum(Res), 
+              S=sum(Sens)) %>% 
+    mutate(Total=R+S,
+           PropR=round(R/Total,digits=3)) # calculate weekly totals
+
+# stratify table by species
+  if(length(unique(dt$species))>1){
+    species_propR <- dt %>%
+      group_by(species,Year,R) %>%
+      summarise(count=n()) %>%
+      mutate(R=ifelse(R==1,"Res","Sens")) %>%
+      spread(R, count) %>% 
+      group_by(species,Year) %>% 
+      summarise(R=sum(Res), 
+                S=sum(Sens)) %>% 
+      mutate(Total=R+S,
+             PropR=round(R/Total,digits=3)) %>%
+      select("Species"=species,Year,PropR) %>%
+      filter(!is.na(PropR)) %>%
+      mutate(PropR=round(PropR*100,1)) %>%
+      spread(Year,PropR)
+    species_propR[is.na(species_propR)] <- 0
+    resist_change <- round((last(year_prop$PropR)-first(year_prop$PropR))/first(year_prop$PropR)*100,1)
+  }
+    
+  }
+  if(params$antibiotic=="NONE"){
+    year_prop <- dt %>% filter(Year>=2012) %>% group_by(Year) %>% summarise(Total=n())
+  }
+case_change <- round((last(year_prop$Total)-first(year_prop$Total))/first(year_prop$Total)*100)
+```
+
+`r if(params$antibiotic!="NONE"){"### Antimicrobial resistance"}`
+
+`r if(params$antibiotic!="NONE"){paste("All isolates reported as intermediate have been interpreted as resistant for the purpose of this report. Proportions of isolates of",params$organism,"species resistant to",params$antibiotic,"were calculated by laboratory and by year.")}`
+
+`r if(params$antibiotic!="NONE"){paste("From",param_year,"to",report_year,"for the number of", params$antibiotic, "resistant", params$organism,", resistance")}` __`r if(params$antibiotic!="NONE"){paste(ifelse(resist_change>0,"increased by","decreased by"),resist_change,"%")}`__ `r if(params$antibiotic!="NONE"){paste0("from ",first(year_prop$PropR)*100,"% to", round(last(year_prop$PropR)*100,1),"%")}` 
+
+<br>
+
+__`r if(params$antibiotic!="NONE"){paste("Counts and proportions of", params$antibiotic, "resistant", params$organism, "isolates by year,",params$geog)}`__
+
+```{r resistance_table, include=TRUE}
+if(params$antibiotic!="NONE"){
+  res_year <- year_prop %>%
+      mutate(PropR=round(PropR*100,1)) %>%
+      select(Year,R,S,PropR) %>%
+      rename("%"=PropR,
+             "Resistant"=R,
+             "Susceptible"=S) %>%
+      kable() 
+  res_year
+}
+```
+
+<br>
+
+__`r if(length(unique(dt$species))>1 & params$antibiotic!="NONE"){paste("Proportion of", params$antibiotic, "resistant", params$organism, "isolates by species and year,",params$geog)}`__
+
+```{r resistance_table_species, include=TRUE}
+if(length(unique(dt$species))>1 & params$antibiotic!="NONE"){
+  kable(species_propR, "html") %>%
+    add_header_above(c(" "=1,"Proportion resistant isolates"=ncol(species_propR)-1)) %>%
+    kable_styling(full_width = T)
+}
+```
+
+```{r lab_resistance_data}
+##  LAB, by year, proportion resistance tile plots
+if(params$antibiotic!="NONE"){
+  if(params$geog=="North West"){
+    lab <- dt %>% 
+      filter((Lab_Name %in% c("WHISTON HOSPITAL (PRESCOT)",
+                              "ROYAL LIVERPOOL UNIVERSITY HOSPITAL",
+                              "MACCLESFIELD DISTRICT GENERAL HOSPITAL",
+                              "WARRINGTON DISTRICT GENERAL HOSPITAL",
+                              "LIVERPOOL MICROBIOLOGY LABORATORY",
+                              "ROYAL LIVERPOOL CHILDREN'S HOSP (ALDER HEY)") & 
+                Health_Protection_Team_Name=="Cheshire and Merseyside") |
+               (Lab_Name %in% c("CARLISLE MICROBIOLOGY LABORATORY",
+                                "FURNESS GENERAL HOSPITAL (BARROW IN FURNESS)",
+                                "PRESTON MICROBIOLOGY LABORATORY",
+                                "ROYAL BLACKBURN HOSPITAL",
+                                "ROYAL LANCASTER INFIRMARY",
+                                "VICTORIA HOSPITAL (BLACKPOOL)") & 
+                  Health_Protection_Team_Name=="Cumbria and Lancashire") |
+               (Lab_Name %in% c("HPA NORTH WEST MANCHESTER LABORATORY",
+                                "HOPE HOSPITAL (SALFORD)",
+                                "ROYAL BOLTON HOSPITAL",
+                                "ROYAL OLDHAM HOSPITAL",
+                                "STEPPING HILL HOSP (STOCKPORT)",
+                                "TRAFFORD GENERAL HOSPITAL (MANCHESTER)",
+                                "TAMESIDE GENERAL HOSPITAL (ASHTON-UNDER-LYNE)") &
+                  Health_Protection_Team_Name=="Greater Manchester"))
+  }
+  lab <- lab %>% 
+    group_by(Health_Protection_Team_Name,Lab_Name,Year, R) %>% 
+    summarise(count=n()) %>%
+    mutate(R=ifelse(R==1,"Res","Sens")) %>%
+    spread(R, count) %>%
+    mutate(prop=round(Res/(Sens+Res),digits=3))
+  lab[is.na(lab)] <- 0
+
+  # NOT USED AT THE MOMENT
+  lab <- year_prop %>% 
+    select(Year,PropR) %>% 
+    right_join(lab,Year_prop,by="Year") %>%
+    mutate(exceed=ifelse(prop>(sqrt(PropR))*3,1,0)) # set to 3SD above mean?
+
+  resgrid <- list()
+  j <- 1
+  for(i in hpts){
+    print(i)
+    labres <- lab %>% mutate(prop=round(prop*100,1)) %>%
+      filter(Health_Protection_Team_Name==i) %>%
+      ggplot(aes(x=Year,y=Lab_Name)) +
+      geom_tile(aes(color="white", fill=prop), colour = "white") + 
+      scale_fill_gradient(name="Resistant \nisolates (%)",
+                          breaks=scales::pretty_breaks(),
+                          low = "#f2e9ea",high = "#822433") +
+      ylab("Lab Name") +
+      scale_x_continuous(breaks=as.numeric(levels(as.factor(lab$Year)))) +
+      theme_bw() +
+      theme(legend.position = "right",
+            panel.grid = element_blank()) +
+      labs(title=i)
+    resgrid[[j]] <- labres
+    j <- j+1
+  }
+  labres <- plot_grid(plotlist=resgrid,ncol=1,align="v")
+
+#  ggsave(filename = "g_lab_graph.png", labres, width=8, height=8, unit = "in", dpi=300)
+}
+```
+
+<br>
+
+__`r if(params$antibiotic!="NONE"){paste("Proprortion of",params$antibiotic,"resistant",params$organism,"by HPT, laboratory and year,",params$geog)}`__
+
+```{r labres_graph, include=TRUE, dpi=300, fig.height=8, fig.width=8}
+if(params$antibiotic!="NONE"){
+  labres
+}
+```
+
+<br>
+
+## Excedances
+
+These analysis use specimen date. Due the loading delays, totals for the previous few weeks should be reviewed.
+
+Exceedances necessitate further investigation to establish if there is a true outbreak or cluster.
+
+The total in each week is compared to data from the previous `r report_year-param_year-1` years from `r paste(param_year,"to",report_year-1)`. Exceedances are marked when the weekly total is greater than the historical data (broken red line).
+
+<br>
+
+```{r csum_graphs}
+
+# CREATE the c-charts for the HPTs and FES
+# do you want it to be only resistant isolates
+if(params$antibiotic=="ALL" | params$antibiotic=="NONE"){
+  csum <- dt %>% select(Specimen_Date,Health_Protection_Team_Name)
+  graph_name <- params$organism
+}else{
+  csum <- dt %>% select(Specimen_Date,Health_Protection_Team_Name,R) %>% filter(R==1)
+  graph_name <- paste(params$antibiotic,"RESISTANT",params$organism)
+}
+
+# loop this over levels of HPT isntead for softcode
+cs <- csum_graph(dt=csum, title=paste("FS",params$geog))
+
+grid2 <- list(cs)[1]
+j <- 2
+for(i in hpts){
+  hpt_g <- csum_graph(dt=csum, hpt=i, title=i)
+  grid2[[j]] <- hpt_g
+  j <- j+1
+}
+csum_grid <- plot_grid(plotlist=grid2,ncol=1,align="v")
+
+```
+
+
+#### Total case exceedance
+
+The exceedance limit (broken red line) is calculated as the average weekly cumulative sum. 
+
+__Cases of `r params$organism` since week 01 of `r report_year` compared to historical data since `r param_year`, `r params$geog`__
+
+```{r csum_graph, include=TRUE, dpi=300, fig.height=12, fig.width=9}
+  csum_grid
+```
+
+<br>
+
+#### Weekly exeedances
+
+The exceedance limit (shown as a broken red line) is calculated using an algorithm published by Noufaily et al. in 2013, this is a development of the algorithm published by Farrington et al. in the early 90s. ^1,2^  
+
+If the column is burgandy then the total for the week is greater than the exceedance limit.
+
+```{r farrflex_exceedance_graphs}
+# CREATE the c-charts for the HPTs and FES
+# do you want it to be only resistant isolates
+if(params$antibiotic=="ALL" | params$antibiotic=="NONE"){
+  farrflex <- dt %>% select(Specimen_Date,Health_Protection_Team_Name)
+  graph_name <- params$organism
+}else{
+  farrflex <- dt %>% select(Specimen_Date,Health_Protection_Team_Name,R) %>% filter(R==1)
+  graph_name <- paste(params$antibiotic,"RESISTANT",params$organism)
+}
+
+# loop this over levels of HPT isntead for softcode
+fs <- farrflex.graph(dt=farrflex, title=paste("FS",params$geog))
+
+grid <- list(fs)[1]
+j <- 2
+for(i in hpts){
+  hpt_g <- farrflex.graph(dt=farrflex, hpt=i, title=i)
+  grid[[j]] <- hpt_g
+  j <- j+1
+}
+farr_grid <- plot_grid(plotlist=grid,ncol=1,align="v")
+
+#ggsave(filename = "g_exceedances.png", farr_grid, width=9, height=12, unit = "in", dpi=300)
+
+
+```
+
+
+<br>
+
+__Cases of `r params$organism` over past 52 ISO weeks compared to historical data since `r param_year`, `r params$geog`__
+```{r exceedance_graph, include=TRUE, dpi=300, fig.height=12, fig.width=9}
+  farr_grid
+```
+
+
+
+
+## Limitations of analysis
++ Based on routine data; hospitals may vary in factors including screening practice, diagnostic practice and laboratory practice
++	Reporting may have increased over the period of analysis.
++	No information on admission dates available; it is not possible to distinguish hospital-acquired cases from other cases
++	Numbers of isolates reported by laboratories vary widely; some are very low or zero.
+
+
+## References
+
+1. Noufaily A, Enki D, Farrington P, Garthwaite P, Andrews N, Charlett A. An Improved Algorithm for Outbreak Detection in Multiple Surveillance Systems. Online Journal of Public Health Informatics. 2013;5(1):e148.
+
+2. Farrington CP, Andrews NJ, Beale AJ, Catchpole MA. A Statistical Algorithm for the Early Detection of Outbreaks of Infectious Disease. Journal of the Royal Statistical Society Series A. 1996;159:547-563.
