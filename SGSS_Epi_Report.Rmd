@@ -2,7 +2,7 @@
 pagetitle: "SGSS Exceedance Report: North West"
 output: 
   html_document: 
-      theme: simplex
+      theme: yeti
       toc: yes
       toc_depth: 4
       toc_float:
@@ -17,12 +17,12 @@ params:
   organism:
     label: "Organism:"
     input: select
-    value: "ENTEROCOCCUS"
+    value: "LISTERIA"
     choices: ["ENTEROCOCCUS","ACHROMOBACTER","PSEUDOMONAS","KLEBSIELLA","ACINETOBACTER","LISTERIA","LEGIONELLA","INFLUENZA A","INFLUENZA B","PARAINFLUENZA"]
   antibiotic:
     label: "Antibiotic:"
     input: select
-    value: "VANCOMYCIN"
+    value: "NONE"
     choices: ["NONE","VANCOMYCIN","PENICILLIN","AMOXYCILLIN/CLAVULANATE","CARBAPENEMS","CIPROFLOXACIN","GENTAMICIN","CEFOTAXIME","CEFTAZIDIME","CEFTRIAXONE","ALL"]
   spectype:
     label: "Specimen types to omit"
@@ -39,7 +39,7 @@ params:
   ref_date:
     label: "Analysis reference date:"
     input: date
-    value: "2018-01-01"
+    value: "2017-12-01"
   sgss_module:
     label: "SGSS module:"
     input: select
@@ -80,6 +80,7 @@ library(kableExtra)
 library(ggplot2)
 library(cowplot)
 library(ggrepel)
+library(captioner)
 
 # mapping tools
 library(rgisws)

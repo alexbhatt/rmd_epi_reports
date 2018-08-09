@@ -12,12 +12,18 @@ params:
   ref_date:
     label: "Analysis reference date:"
     input: date
-    value: "2018-07-01"
+    value: "2018-06-01"
     format: "yyyy-mm-dd"
   data:
-    label: "HPZone export (all core values from 01-01-2012)"
-    value: ""
-    input: file
+    label: "HPZone export"
+    input: select
+    value: "NWcases"
+    choices: ["NWcases","Upload"]
+  org:
+    label: "Report organism (set to upload if uploading)"
+    input: select
+    value: "Upload"
+    choices: ["Upload",""]
   hpt:
     label: "Health Protection Team"
     input: select
@@ -59,6 +65,7 @@ library(lubridate)
 # markdown and formatting
 library(knitr)
 library(kableExtra)
+library(captioner)
 library(ggplot2)
 library(cowplot)
 library(ggrepel)
@@ -71,8 +78,35 @@ library(rgdal)
 
 getwd()
 
-```
+tcap <- captioner(prefix="Table")
+fcap <- captioner(prefix="Figure")
 
+# for info. if you name them, dosent work in ggplot.
+phe_nhs_colours <- c(
+  phe_burgundy="#822433",
+  phe_teal="#00B092",
+  nhs_orange="#EAAB00",
+  nhs_dark_blue="#003087",
+  nhs_dark_grey="#425563",
+  light_blue="#8CB8C6",
+  nhs_purple="#330072",
+  nhs_green="#006747",
+  light_grey="#E8EDEE",
+  nhs_blue="#005EB8",
+  nhs_yellow="#FAE100",
+  slate="#DAD7CB",
+  nhs_light_blue="#0072CE",
+  light_orange="#E9994A",
+  nhs_light_green="#78BE20")
+
+# for the ggplot.
+phe_colours <- c("#822433","#00B092","#EAAB00",
+                 "#003087","#425563","#8CB8C6",
+                 "#330072","#006747","#E8EDEE",
+                 "#005EB8","#FAE100","#DAD7CB",
+                 "#0072CE","#E9994A","#78BE20")
+
+```
 
 ```{r functions}
 exceedance_graph <- function(data,
@@ -193,7 +227,7 @@ exceedance_graph <- function(data,
                          breaks=scales::pretty_breaks(), 
                          expand = c(0.01,0.01)) +
       scale_x_discrete(name="ISO Year Week") +
-      labs(graph_title=graph_title)
+      labs(title=graph_title)
     
     return(farrgraph)
 }
@@ -228,7 +262,7 @@ if(exeedance_type=="cumsum"){
                        breaks=scales::pretty_breaks(),
                        expand = c(0.01,0.01)) +
     scale_x_discrete(name="Year and Week") +
-    labs(graph_title=graph_title)
+    labs(title=graph_title)
   
   return(csum_graph)
   
@@ -238,39 +272,68 @@ if(exeedance_type=="cumsum"){
 
 ```
 
-
 ```{r import}
 
-if(params$data==""){file <- choose.files()}else{file <- params$data}
+# allow user to upload file 
+if(params$data=="Upload"){file <- choose.files()}else{
+  file <- params$data
+  raw <- fread(file) %>% clean_names() %>% remove_empty(which=c("rows", "cols"))
+}else{
+# or use the NWcases/context linelist which kattPlatt does
+  linelist <- readxl::read_xlsx("//filenwt06/PHE North West/A CORE SERVICES/Health Protection/Surveillance/Routine/NWcases.xlsx",
+                           sheet="cases") %>% 
+    clean_names() %>% remove_empty(which=c("rows", "cols"))
+  context <- readxl::read_xlsx("//filenwt06/PHE North West/A CORE SERVICES/Health Protection/Surveillance/Routine/NWcontexts.xlsx",
+                           sheet="contexts") %>% 
+    clean_names() %>% remove_empty(which=c("rows", "cols"))
+  
+  raw <- left_join(linelist,context,by=c("case_indentifier"="case_identifier")) 
+}
 
-raw <- fread(file) %>% clean_names() %>% remove_empty()
+
 # glimpse(raw)
+
+# shapefiles
+shp_hpt <- spTransform(readOGR("./core/shp/hpt"), 
+                   CRS("+proj=longlat +datum=WGS84"))
+shp_hpt <- shp_hpt[shp_hpt$PARENTPHEC=="X25003AG",]
+
+shp_la <- spTransform(readOGR("./core/shp/nw_local_authority"), 
+                   CRS("+proj=longlat +datum=WGS84"))
+
+shp_pcd <- spTransform(readOGR("./core/shp/postcode_districts"), 
+                   CRS("+proj=longlat +datum=WGS84"))
 
 ```
 
-
 ```{r hpzone_linelist}
 
+# grab the current LA setup
+pc <- postcode_lookup(raw$postcode,col_names=c("oslaua"), xy=4326)
+la_lookup <- shp_la@data %>% select(LADCD,LADNM)
+pc <- inner_join(pc,la_lookup,by=c("oslaua"="LADCD")) %>% distinct(.keep_all = T)
+
 # clean
-dt <- raw %>% ungroup() %>%
-  mutate_all(funs(replace(.,.=="",NA))) %>%
-  mutate_if(grepl("name",names(raw)),
-            funs(toupper(.))) %>%
-  mutate_if(grepl("^date|date$",names(raw)),
-            funs(dmy(.))) %>%
+dt <- left_join(raw,pc,by=c("postcode"="input_pcd")) %>%
+  ungroup() %>%
+  mutate_all(funs(replace(.,.=="",NA))) %>%  
+  mutate_at(vars(matches("^date|date$")),funs(dmy(.))) %>%
+  mutate_at(vars(contains("name")),funs(toupper(.)))  %>%
   filter(confidence!="Discarded",
          hpu_of_residence==params$hpt) %>%
   mutate(nhs_number=as.numeric(gsub("\\s","",nhs_number)),
          confidence=factor(confidence,
                            levels=c("Confirmed","Probable","Possible")),
          hpu_of_residence=as.factor(gsub("and","&",hpu_of_residence)),
-         local_authority=as.factor(gsub(" District","",local_authority)),
+         la_original=trim(gsub("District","",local_authority)),
+         local_authority=as.factor(if_else(is.na(LADNM),la_original,as.character(LADNM))), ## swap to LADNM
          age=as.integer(date_of_onset-date_of_birth)/365.25,
          agegrp=cut(age, c(0,1,5,15,25,35,45,55,65,75,150), right=FALSE,
-                 labels = c("<1","1-4","5-14","15-24","25-34","35-44","45-54","55-64","65-74",">=75")),
+                     labels = c("<1","1-4","5-14","15-24","25-34","35-44","45-54","55-64","65-74",">=75")),
          year=year(date_of_onset),
-         postcode=ifelse(is.na(postcode),temp_postcode,postcode))
-
+         postcode=ifelse(is.na(postcode),temp_postcode,postcode)) # %>%
+#  rename(date_of_death=date_of_death_where_appropriate) ## apparently this is missing in some.
+nrow(dt)
 # glimpse(dt)
 ```
 
@@ -295,6 +358,8 @@ nhs_unknown <- c(0000000000,1234567890,9876543210,9999999999,NA)
     select(id,everything()) %>%
     distinct(id,date_entered,date_of_onset,hpu_of_residence,infection,.keep_all=T)
   
+  nrow(dt)
+  
 org <- unique(dt$infection)
 
 hpts <- levels(dt$hpu_of_residence)
@@ -304,50 +369,29 @@ lan <- length(las)
 report_year <- year(max(dt$date_of_onset,na.rm=T))
 param_year <- year(min(dt$date_of_onset,na.rm=T))
 extract_date <- max(dt$date_entered,na.rm=T)
+```
 
+```{r reference_data}
 # reference date dataset
 epic <- dt %>% 
   filter(date_of_onset>=params$ref_date) %>%
-  select(id,case_number,gender,agegrp,date_of_onset,date_entered,confidence,infection,diagnosis,
+  select(id,case_number,gender,agegrp,ethnic_origin,country_of_birth,intravenous_drug_user,pregnant,
+         organism_species,date_of_onset,date_entered,confidence,infection,diagnosis,#date_of_death,
          hpu_of_residence,local_authority,postcode,post_district,longitude,latitude) %>%
   mutate(local_authority=as.factor(as.character(local_authority)))
+
+nrow(epic)
 
 epic_no_cases <- unique(las[!las %in% levels(epic$local_authority)])
 
 ```
 
-
-<br>
-
-![](public-health-england.png){width=120px}
-
-
-# Field Service North West
-## `r params$hpt` HPT
-__HPZone Exceedance Report__
-
-__Extract date: `r format(ymd(extract_date), '%d %B %Y')`; ISO Week: `r isoweek(ymd(extract_date))`__
-
-__Report run date: `r format(Sys.Date(), '%d %B %Y')`__
-
-__OFFICIAL - SENSITIVE__
-
-This report is for internal PHE use only.
-
-<br>
-
-This report is based on analysis of data from the Public Health England (PHE) local case management system, HPZone. HPZone provides the most timely line list data for the purpose of local `r org` surveillance. Extract date is based on the last case entered into HPZone within the extract. __The following analysis uses reported onset date.__
-
-Records have been deduplicated to reflect patient episodes (first infection). Patients were identified by NHS number and date of birth. 
-
-# `r org` Epidemiology
-
 ```{r intro_bullets}
 
 ## HPT with highest count
-  hi_hpt <- with(dt,table(local_authority,year))
-  hi_hpt_percent <- round(max(prop.table(hi_hpt[,ncol(hi_hpt)]))*100,1)
-  hi_hpt <- names(which.max(hi_hpt[,ncol(hi_hpt)]))
+  hi_area <- with(dt,table(local_authority,year))
+  hi_area_percent <- round(max(prop.table(hi_area[,ncol(hi_area)]))*100,1)
+  hi_area <- names(which.max(hi_area[,ncol(hi_area)]))
 
 ## % change
   now <- nrow(dt[dt$date_of_onset>=paste0(report_year,"-01-01"),])
@@ -364,28 +408,159 @@ Records have been deduplicated to reflect patient episodes (first infection). Pa
     mutate(iw=factor(isoweek(date_of_onset))) %>% 
     group_by(iw) %>% summarise(n=n()) %>% filter(n==max(n))
 
+
+  
 ```
 
-<br>
-
-In `r report_year` there has been a __`r abs(count_change)`%__ `r ifelse(count_change>0,"increase","decrease")` in reported postive isolates compared to the same time `r report_year-1`.
-
-In the North West since __`r format(as.Date(params$ref_date), '%d %b %Y')`__ (ISO week __`r paste(isoyear(params$ref_date),isoweek(params$ref_date))`__): 
-
-  + there have been __`r nrow(dt[dt$date_of_onset>=params$ref_date,])`__ cases (confirmed, probable and possible)
-  + of which, __`r ifelse(percent_male>=percent_female,percent_male,percent_female)`%__ were `r ifelse(percent_male>percent_female,"male","female")`
-  + the last reported case had an onset date on __`r format(last_onset,na.rm=T, "%d %b %Y")`__ ISO week __`r isoweek(last_onset)`__
-  + peak of __`r max(peak$n)`__ cases was seen in ISO week(s) __`r peak$iw`__
-  + the most cases (__`r hi_hpt_percent`%__ of total) were seen in the __`r hi_hpt`__ Local Authority 
-
 
 <br>
 
-## Local Authority
+![](./core/public-health-england.png){width=120px}
 
-__All HPZone reported cases of `r org` by Local Authority and year, `r params$hpt`__
 
-```{r HPT_table, include=TRUE}
+# Descriptive epidemiology of `r org` in `r  params$hpt`, `r report_year`
+
+#### Field Service North West
+#### `r params$hpt` HPT
+
+__Extract date: `r format(ymd(extract_date), '%d %B %Y')`; ISO Week: `r isoweek(ymd(extract_date))`__
+
+__Report date: `r format(Sys.time(), '%d %B %Y at %H:%M')`__
+
+Author: [Alex Bhattacharya](mailto:alex.bhattacharya@phe.gov.uk), FETP, Field Service NW
+
+__OFFICIAL - SENSITIVE__
+
+_This report is for internal PHE use only._
+
+<br>
+
+<br>
+
+# Introduction
+
+1. 
+    1. This summary is provided primarily to give epidemiological information for consideration for further health protection action.
+    
+    2. This report is based on analysis of data from the Public Health England (PHE) local case management system, HPZone. HPZone provides the most timely line list data for the purpose of local `r org` surveillance. Extract date is based on the last case entered into HPZone within the extract. __The following analysis uses reported onset date.__
+
+    3. Records have been deduplicated to reflect patient episodes (first infection). Patients were identified by NHS number and date of birth. 
+    
+    4. [point on organism]
+
+<br>
+
+# Key Points
+2. 
+    1. between __`r format(as.Date(params$ref_date), '%d %b %Y')`__ (ISO week __`r paste(isoyear(params$ref_date),isoweek(params$ref_date))`__) and __`r format(Sys.Date(), '%d %b %Y')`__ (ISO week __`r paste(isoyear(Sys.Date()),isoweek(Sys.Date()))`__) there have been __`r nrow(epic)`__ `r org` cases in `r params$hpt` Health Protection Team (HPT)
+    
+    2. the last reported case had an onset date on __`r format(max(epic$date_of_onset,na.rm=T), '%d %b %Y')`__
+    
+    3. [additional observations]
+    
+
+<br>
+
+# Summary of ongoing investigation
+
+3.
+    1. [insert summary]
+
+<br>
+
+# Epidemiological description of cases
+
+4. 
+    1. This report only includes records of __`r org`__ cases in the __`r params$hpt`__ HPT
+    
+    2. Since the beginning of `r report_year` there has been a __`r abs(count_change)`%__ `r ifelse(count_change>0,"increase","decrease")` in reported postive isolates compared to the same time in `r report_year-1`.
+    
+    3. between __`r format(as.Date(params$ref_date), '%d %b %Y')`__ (ISO week __`r paste(isoyear(params$ref_date),isoweek(params$ref_date))`__) and __`r format(Sys.Date(), '%d %b %Y')`__ (ISO week __`r paste(isoyear(Sys.Date()),isoweek(Sys.Date()))`__):
+
+      + there have been __`r nrow(dt[dt$date_of_onset>=params$ref_date,])`__ cases (confirmed, probable and possible)
+      
+      + of which, __`r ifelse(percent_male>=percent_female,percent_male,percent_female)`%__ were `r ifelse(percent_male>percent_female,"male","female")`
+      
+      + the last reported case had an onset date on __`r format(last_onset,na.rm=T, "%d %b %Y")`__ ISO week __`r isoweek(last_onset)`__
+      
+      + peak of __`r max(peak$n)`__ cases was seen in ISO week(s) __`r peak$iw`__
+      
+      + the most cases (__`r hi_area_percent`%__ of total) were seen in the __`r hi_area`__ Local Authority 
+
+      + there were no cases seen in the following local authorities: __`r paste(epic_no_cases)`__
+ 
+## Time
+
+
+```{r EpiCurve_data}
+if(max(epic$date_of_onset,na.rm=T)-min(epic$date_of_onset,na.rm=T)<62){
+  epic_x <- "day"
+  epic_xlab <- "Date"
+  
+}else{
+  epic_x <- "iso.week"
+  epic_xlab <- "ISO Week"
+}
+epic_agg <- epicurve(epic,
+         date.col="date_of_onset",
+         time.period=epic_x,
+         start.at=params$ref_date,
+         stop.at=ymd(extract_date),
+         xlab=epic_xlab,
+         fill.by="confidence",
+         epi.squares=T,
+         blank.background=T,
+         na.rm=T) + 
+  scale_fill_manual(values=phe_colours) +
+  theme(legend.position = "bottom",
+        legend.text=element_text(size=8)) +
+  guides(fill=guide_legend(nrow=4))
+if(epic_x=="day"){
+  epic_agg <- epic_agg + theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1,size=8))
+}
+epic_loc <- epic %>% mutate(local_authority=as.character(local_authority)) %>%
+  epicurve(date.col="date_of_onset",
+           time.period=epic_x,
+           start.at=params$ref_date,
+           stop.at=ymd(extract_date),
+           split.by="local_authority",
+           xlab=epic_xlab,
+           fill.by="confidence",
+           epi.squares=T,
+           blank.background=T,
+           na.rm=T) +
+  scale_fill_manual(values=phe_colours) +
+  theme(legend.position = "none",
+        strip.text.y=element_text(size=10),
+        axis.text=element_text(size=8))
+if(epic_x=="day"){
+  epic_loc <- epic_loc + theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1, size=8))
+}
+
+grid <- list(epic_agg,epic_loc)
+
+epic_height_mod <- length(table(as.character(epic$local_authority)))
+stack_fig_height <- epic_height_mod*2+4
+
+epicurve <- plot_grid(plotlist=grid,ncol=1, align="v", axis="r", rel_heights=c(3,epic_height_mod))
+
+fcap(name="epicurve",
+     caption=paste0("Epidemic curve of ",org," from ",format(as.Date(params$ref_date),"%d %b %Y"),", ",params$hpt))
+
+```
+
+__`r fcap("epicurve")`__
+
+```{r epicurve, include=T, fig.width=9, fig.height=stack_fig_height}
+epicurve
+```
+
+
+<br>
+
+## Location
+
+```{r HPT_table data}
 tabLA <- dt %>% 
   mutate(local_authority=gsub(" District","",local_authority)) %>%
   group_by(local_authority,confidence,year) %>% 
@@ -398,125 +573,25 @@ tabHPT <- dt %>%
   spread(year,n) %>%
   rename("Local Authority"=1,"Confidence"=2) 
 
-tab3 <- bind_rows(tabLA,tabHPT) %>%
+local_table <- bind_rows(tabLA,tabHPT) %>%
   rename("Local Authority"=1,"Confidence"=2) %>%
   mutate_all(funs(replace(.,is.na(.),0))) 
   
-b1 <- nrow(tab3)-2
+b1 <- nrow(local_table)-2
 
-kable(tab3) %>% 
+tcap(name="local_table",
+     caption=paste("All HPZone reported cases of",org,"by Local Authority and year,",params$hpt))
+```
+
+<br>
+
+__`r tcap("local_table")`__
+
+```{r local_table, include=TRUE}
+kable(local_table) %>% 
   collapse_rows(columns=1,valign="middle") %>% 
   kable_styling(full_width=T) %>%
   row_spec(b1:nrow(tab3),bold=T)
-```
-
-<br>
-
-Between `r format(as.Date(params$ref_date),"%d %b %Y")` and `r format(as.Date(extract_date),"%d %b %Y")` there were no cases seen in the following local authorities:
-
- + `r paste(epic_no_cases)`
- 
-## Epicurve
-
-__`r paste0("Epicurve of ",org," from ",format(as.Date(params$ref_date),"%d %b %Y"),", ",params$hpt)`__
-
-```{r EpiCurve_data}
-if(max(epic$date_of_onset,na.rm=T)-min(epic$date_of_onset,na.rm=T)<62){
-  epic_x <- "day"
-  epic_xlab <- "Date"
-  
-}else{
-  epic_x <- "iso.week"
-  epic_xlab <- "ISO Week"
-}
-nwe <- epicurve(epic,
-         date.col="date_of_onset",
-         time.period=epic_x,
-         start.at=params$ref_date,
-         stop.at=ymd(extract_date),
-         xlab=epic_xlab,
-         fill.by="confidence",
-         col.pal="phe",
-         epi.squares=T,
-         blank.background=T,
-         na.rm=T) +
-    theme(legend.position = "bottom",
-          legend.text=element_text(size=8)) +
-    guides(fill=guide_legend(nrow=4))
-if(epic_x=="day"){
-  nwe <- nwe + theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1,size=8))
-}
-hpte <- epic %>% mutate(local_authority=as.character(local_authority)) %>%
-  epicurve(date.col="date_of_onset",
-           time.period=epic_x,
-           start.at=params$ref_date,
-           stop.at=ymd(extract_date),
-           split.by="local_authority",
-           xlab=epic_xlab,
-           fill.by="confidence",
-           col.pal="phe",
-           epi.squares=T,
-           blank.background=T,
-           na.rm=T) +
-    theme(legend.position = "none",
-          strip.text.y=element_text(size=10),
-          axis.text=element_text(size=8))
-if(epic_x=="day"){
-  hpte <- hpte + theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1, size=8))
-}
-
-grid <- list(nwe,hpte)
-
-epic_height_mod <- length(table(as.character(epic$local_authority)))
-stack_fig_height <- epic_height_mod*2+4
-
-epicurve <- plot_grid(plotlist=grid,ncol=1, align="v", axis="r", rel_heights=c(3,epic_height_mod))
-
-
-
-```
-
-```{r epicurve, include=T, fig.width=9, fig.height=stack_fig_height}
-epicurve
-```
-
-
-
-
-<br>
-
-## Age sex pyramid
-
-__`r paste0("Age sex pyramid of ",org," from ",format(as.Date(params$ref_date),"%d %b %Y"),", ",params$hpt)`__
-
-
-```{r AgeSex, include=TRUE, fig.width=9, fig.height=stack_fig_height}
-
-nwas <- epic %>% 
-  age_sex_pyramid(age.grp.col="agegrp",
-                  sex.col="gender",
-                  col.pal="phe",
-                  blank.background=T)
-
-hptas <- epic %>% mutate(local_authority=as.character(local_authority)) %>%
-  age_sex_pyramid(age.grp.col="agegrp",
-                  sex.col="gender",
-                  col.pal="phe",
-                  blank.background=T,
-                  split.by="local_authority") +
-  theme(legend.position = "none",
-            strip.text.y=element_text(size=10),
-            axis.text.x=element_text(size=10),
-            axis.text.y=element_text(size=10))
-
-
-grid <- list(nwas,hptas)
-
-agesex <- plot_grid(plotlist=grid,ncol=1,align="v",axis="l",rel_heights=c(3,epic_height_mod))
-
-agesex
-
-
 ```
 
 
@@ -543,62 +618,70 @@ pcd <- unique(map$post_district[map$n>1])
 mapbox <- make_bbox(longitude,latitude,map)
 mapzoom <- calc_zoom(mapbox)-1
 
-shp_hpt <- spTransform(readOGR("F:/FIELD EPIDEMIOLOGY/INFORMATICS/ArcGIS/shape files/hpt"), 
-                   CRS("+proj=longlat +datum=WGS84"))
-shp_hpt <- shp_hpt[shp_hpt$PARENTPHEC=="X25003AG",]
+# shp file mods
+la_hover <- map %>% 
+  #group_by(local_authority,other) %>% summarise(n=n()) %>% 
+  group_by(local_authority) %>% summarise(n=n()) %>% 
+  #spread(other,n) %>%
+  mutate(hover=paste0(local_authority," | ",
+                      "Cases: ",n
+                      #"; breakdown other: ",other
+                      ))
 
-shp_la <- spTransform(readOGR("../nw_la_shp"), 
-                   CRS("+proj=longlat +datum=WGS84"))
+shp_la@data <- left_join(shp_la@data,la_hover,by=c("LADNM"="local_authority"))
+shp_la@data <- mutate(shp_la@data,hover=ifelse(is.na(hover),paste0(LADNM,": no reported cases"),hover))
 
-shp_pcd <- spTransform(readOGR("F:/FIELD EPIDEMIOLOGY/INFORMATICS/ArcGIS/shape files/postcode_districts"), 
-                   CRS("+proj=longlat +datum=WGS84"))
 shp_pcd <- shp_pcd[shp_pcd$PC_DISTRIC %in% pcd,]
-
-
-pal <- colorFactor(palette = c("#98002e","#00ae9e","#003087"),
-                   levels =c("Confirmed","Probable","Possible"),
-                   domain=epic$confidence)
-
 ```
 
+
 ```{r i_can_show_you_the_world_map}
+
+# set the colour palette
+pal <- colorFactor(palette=phe_colours,,
+                   levels=levels(map$confidence),
+                   domain=map$confidence)
+
 # interactive leaflet map
-casemap <- leaflet() %>% 
+casemap <- leaflet(map,
+                   width="100%") %>% 
     addTiles(group = "OpenStreetMap") %>%
     setView(mean(map$longitude,na.rm=T),
             mean(map$latitude,na.rm=T),
             zoom=mapzoom) %>%
-    addPolygons(data = shp_hpt, fill = T, fillOpacity = 0.4,
-                weight = 1,
-                stroke = TRUE,
-                opacity = 1,
-                color = "black",
-                fillColor = "white",
-                group = "Health Protection Teams",
-                label=~HPTNM,
-                highlightOptions=highlightOptions(sendToBack=T,
-                                                bringToFront=F)) %>%
     addPolygons(data = shp_la, fill = T, fillOpacity = 0.4,
                 weight = 1,
                 stroke = TRUE,
                 opacity = 1,
                 color = "black",
-                fillColor = "white",
+                fillColor = " #f8f9f9",
                 group = "Local Authority",
-                label=~LADNM,              
+                label=~hover,              
                 highlightOptions=highlightOptions(sendToBack=T,
-                                                bringToFront=F)) %>%
-    addPolygons(data = shp_pcd, fill = T, fillOpacity = 0.2,
+                                                bringToFront=F)) %>%    
+  addPolygons(data = shp_hpt, fill = T, fillOpacity = 0.4,
                 weight = 1,
                 stroke = TRUE,
                 opacity = 1,
-                color = "red",
-                fillColor = "red",
-                group = "Cluster Districts",
-                label=~PC_DISTRIC,
+                color = "black",
+                fillColor = " #f8f9f9",
+                group = "Health Protection Teams",
+                label=~HPTNM,
                 highlightOptions=highlightOptions(sendToBack=T,
-                                                bringToFront=F)) 
-  
+                                                bringToFront=F))
+if(length(pcd!=0)){
+    casemap <- casemap %>%
+      addPolygons(data = shp_pcd, fill = T, fillOpacity = 0.2,
+                  weight = 1,
+                  stroke = TRUE,
+                  opacity = 1,
+                  color = "red",
+                  fillColor = "red",
+                  group = "Cluster Districts",
+                  label=~PC_DISTRIC,
+                  highlightOptions=highlightOptions(sendToBack=T,
+                                                    bringToFront=F)) 
+}
 map_d <- split(map,map$confidence)
 names(map_d) %>%
   purrr::walk(function(d){
@@ -621,7 +704,7 @@ names(map_d) %>%
   }})
 
 casemap <- casemap %>% 
-  addLayersControl(baseGroups=c("Health Protection Teams","Local Authority"),
+  addLayersControl(baseGroups=c("Local Authority","Health Protection Teams"),
                    overlayGroups=c(names(map_d),"Cluster Districts"),
                    options=layersControlOptions(collapsed=F)) %>%
   addControl(html='<font color="#98002e">OFFICIAL - SENSITIVE</font>', 
@@ -632,47 +715,167 @@ casemap <- casemap %>%
             values=map$confidence) %>%
     addMeasure()
 
+fcap(name="map",
+     caption=paste0("Map of ",org," from ",format(as.Date(params$ref_date),"%d %b %Y"),", ",params$hpt))
+
+
 ```
 
 <br>
 
-## Point map
-
-__`r paste0("Map of ",org," from ",format(as.Date(params$ref_date),"%d %b %Y"),", ",params$hpt)`__
+__`r fcap("map")`__
 
 _Hover over cases for the HPZone onset date, click on case points for more details._
 
-```{r map_output, include=TRUE,fig.height=7,fig.width=9}
+```{r map_output, include=TRUE, out.height=750}
 casemap
 ```
+
+
 <br>
 
-Postcode district clusters here are defined with case onset being within `r params$infec_period` days 
-
-__Postcode district clusters since `r format(as.Date(params$ref_date), '%d %b %Y')`, `r params$hpt`__
-
-```{r cluster_table, include=TRUE}
+```{r cluster_table}
 cluster <- map %>% 
   ungroup() %>%
   filter(n>1) %>%
-  arrange(local_authority,post_district,cluster_id,date_of_onset) %>%
-  group_by(cluster_id) %>%
+  arrange(local_authority,post_district,date_of_onset) %>%
+  group_by(post_district) %>%
   mutate(start=min(date_of_onset,na.rm=T),
          end=max(date_of_onset,na.rm=T)) %>%
   distinct(local_authority,post_district,n,start,end) %>%
-  ungroup() %>% select(-cluster_id) %>%
-  rename("Local Authority"=local_authority,"Post District"=post_district,"Cases"=n,"Earliest onset"=start,"Latest onset"=end) 
+  ungroup() %>% 
+  mutate(post_district=ifelse(is.na(post_district),"No fixed abode",post_district)) %>%
+  rename("Local Authority"=local_authority,"Post District"=post_district,
+         "Cases"=n,"Earliest onset"=start,"Latest onset"=end) 
 
-kable(cluster,"html") %>%
+if(nrow(cluster)!=0){
+  tcap(name="cluster_table",
+       caption=paste("Postcode district clusters since",format(as.Date(params$ref_date),'%d %b %Y'),",",params$hpt))
+}
+```
+
+__`r tcap("cluster_table")`__
+
+```{r cluster_table_output, include=TRUE}
+if(nrow(cluster)!=0){
+  kable(cluster,"html") %>%
     kable_styling(full_width = T) %>%
-    collapse_rows(column=1,valign="middle")
-
+    collapse_rows(column=1,valign="middle") %>%
+    footnote(general=c(
+     # paste("Postcode district clusters here are defined with case onset being within",params$infec_period,"days"),
+      "Cases in local authority with no fixed abode did not have permanent or temporary postcode and were not point mapped."
+      ))
+}
 ```
 
 
+## Demographics
+
+```{r agesex_data}
+
+agesex_agg <- epic %>% 
+  age_sex_pyramid(age.grp.col="agegrp",
+                  sex.col="gender",
+                  col.pal="phe",
+                  blank.background=T)
+
+agesex_loc <- epic %>% mutate(local_authority=as.character(local_authority)) %>%
+  age_sex_pyramid(age.grp.col="agegrp",
+                  sex.col="gender",
+                  col.pal="phe",
+                  blank.background=T,
+                  split.by="local_authority") +
+  theme(legend.position = "none",
+            strip.text.y=element_text(size=10),
+            axis.text.x=element_text(size=10),
+            axis.text.y=element_text(size=10))
+
+grid <- list(agesex_agg,agesex_loc)
+
+agesex <- plot_grid(plotlist=grid,ncol=1,align="v",axis="l",rel_heights=c(3,epic_height_mod))
+
+fcap(name="agesex",
+     caption=paste0("Age sex pyramid of ",org," from ",format(as.Date(params$ref_date),"%d %b %Y"),", ",params$hpt))
+
+tcap(name="agesex_table",
+     caption=paste0("Summary demographics of age and sex by local authority"))
+
+
+
+```
+
+__`r tcap("agesex_table")`__
+
+```{r demo_summary, include=T}
+dt %>% group_by(local_authority) %>% 
+  mutate(age=as.integer(date_of_onset-date_of_birth)/365.25) %>%
+  filter(date_of_onset>=params$ref_date) %>%
+  summarise(`% male`=round(sum(gender=="Male")/n()*100,1),
+            `% female`=round(sum(gender=="Female")/n()*100,1),
+            min=round(min(age,na.rm=T)),
+            median=round(median(age,na.rm=T)),
+            mean=round(mean(age,na.rm=T)),
+            max=round(max(age,na.rm=T))) %>%
+  rename("Local authority"=local_authority) %>%
+  kable() %>%
+  kable_styling(full_width = T) %>%
+  footnote(general=c(paste(table(dt$gender)[3],"case(s) has unknown sex and",
+                           sum(is.na(dt$agegrp)),"case(s) had unknown age"))) %>%
+  add_header_above(c(" "=1,"Sex"=2,"Age"=4))
+```
+
+__`r fcap("agesex")`__
+
+```{r AgeSex, include=TRUE, fig.width=9, fig.height=stack_fig_height}
+agesex
+```
+
 <br>
 
-# Excedances
+```{r}
+dt %>% group_by(ethnic_origin,year) %>% summarise(n=n()) %>% spread(year,n)
+```
+
+
+## Travel
+
+__`r tcap(name="travel",caption="Countries of travel prior to onset")`__
+
+```{r travel, include=T}
+
+dt %>% filter(date_of_onset>=params$ref_date) %>%
+  mutate(travel=ifelse(recent_travel_to_another_country %in% c(NA,"0","No","Not travelled"),
+                        NA,recent_travel_to_another_country)) %>%
+  filter(!is.na(travel)) %>%
+  group_by(travel) %>%
+  summarise(Cases=n(),
+            min=min(date_of_onset,na.rm=T),
+            max=max(date_of_onset,na.rm=T)) %>%
+  rename("Country of travel"=travel) %>%
+  kable() %>%
+  kable_styling(full_width = T) 
+```
+
+
+
+```{r lab_data}
+tcap(name="strain_typing",
+     caption=paste("Strain typing results by year,",params$hpt))
+```
+
+
+
+```{r strain_typing, include=F}
+# __`r tcap("strain_typing")`__
+
+# not necessary for all reports, often data is poorly completed
+
+table(dt$strain,dt$year) %>% kable() %>% kable_styling(full_width = T)
+#table(dt$serogroup_serotype,dt$year) %>% kable() %>% kable_styling(full_width = T)
+```
+
+
+# Exceedances
 
 These analysis use specimen date. Due the loading delays, totals for the previous few weeks should be reviewed.
 
@@ -711,6 +914,9 @@ csum_grid <- plot_grid(plotlist=grid2,ncol=1,align="v", label_x="Cumulative coun
 
 stack_fig_height <- lan*2+3
 
+fcap(name="cumsum",
+     caption=paste0("HPZone reported cases of ",org," since week 01 of ",report_year," compared to historical data since ",param_year,", North West"))
+
 ```
 
 
@@ -720,7 +926,7 @@ stack_fig_height <- lan*2+3
 
 The exceedance limit (broken red line) is calculated as the average weekly cumulative sum. 
 
-__HPZone reported cases of `r org` since week 01 of `r report_year` compared to historical data since `r param_year`, North West__
+__`r fcap("cumsum")`__
 
 ```{r csum_graph, include=TRUE, dpi=300, fig.width=9, fig.height=stack_fig_height}
   csum_grid
@@ -755,6 +961,10 @@ for(i in las){
 }
 farr_grid <- plot_grid(plotlist=grid,ncol=1,align="v", label_x="Count of cases")
 
+
+fcap(name="farrington",
+     caption=paste0("HPZone reported cases of ",org," over past 52 ISO weeks compared to historical data since ",param_year,", North West"))
+
 ```
 
 <br>
@@ -765,7 +975,7 @@ The exceedance limit (shown as a broken red line) is calculated using an algorit
 
 If the column is burgandy then the total for the week is greater than the exceedance limit.
 
-__HPZone reported cases of `r org` over past 52 ISO weeks compared to historical data since `r param_year`, North West__
+__`r fcap("farrington")`__
 
 ```{r exceedance_graph, include=TRUE, dpi=300, fig.width=9, fig.height=stack_fig_height}
   farr_grid
